@@ -1,0 +1,12 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^cd \"/Users/aditya/Desktop/Coding Agent\" && python3 -m py_compile src/senior_agent/\\*\\.py 2>&1 \\| head -20$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^cd \"/Users/aditya/Desktop/Coding Agent\" && python3 -m pytest tests/ -v --tb=short 2>&1 \\| tail -50$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
