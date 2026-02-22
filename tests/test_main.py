@@ -1,5 +1,6 @@
 import io
 import sys
+import types
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
@@ -90,6 +91,55 @@ class MainCLITests(unittest.TestCase):
 
         self.assertEqual(exit_info.exception.code, 2)
         create_agent_mock.assert_not_called()
+
+    def test_main_requires_command_when_not_serving(self) -> None:
+        with (
+            mock.patch.object(sys, "argv", ["main.py"]),
+            mock.patch("main.create_default_senior_agent") as create_agent_mock,
+            self.assertRaises(SystemExit) as exit_info,
+        ):
+            cli_main.main()
+
+        self.assertEqual(exit_info.exception.code, 2)
+        create_agent_mock.assert_not_called()
+
+    def test_main_serve_mode_dispatches_to_web_api(self) -> None:
+        run_server_mock = mock.Mock()
+        fake_module = types.ModuleType("senior_agent.web_api")
+        fake_module.run_server = run_server_mock
+
+        with (
+            mock.patch.dict(sys.modules, {"senior_agent.web_api": fake_module}),
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "main.py",
+                    "--serve",
+                    "--provider",
+                    "codex",
+                    "--workspace",
+                    ".",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    "8000",
+                ],
+            ),
+            mock.patch("main.create_default_senior_agent") as create_agent_mock,
+        ):
+            cli_main.main()
+
+        create_agent_mock.assert_not_called()
+        run_server_mock.assert_called_once_with(
+            host="127.0.0.1",
+            port=8000,
+            provider="codex",
+            workspace=".",
+            verbose=False,
+            api_key=None,
+            allow_unsecure=False,
+        )
 
 
 if __name__ == "__main__":

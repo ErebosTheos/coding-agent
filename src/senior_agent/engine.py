@@ -259,7 +259,7 @@ class SeniorAgent:
                 checkpoint_metadata=checkpoint_metadata,
             )
 
-        max_attempts = min(self.max_attempts, len(active_strategies))
+        max_attempts = self.max_attempts
         if start_attempt_number > max_attempts:
             blocked_reason = (
                 f"Reached max attempts ({max_attempts}) without a successful verification."
@@ -277,7 +277,8 @@ class SeniorAgent:
             )
 
         for attempt_number in range(start_attempt_number, max_attempts + 1):
-            strategy = active_strategies[attempt_number - 1]
+            strategy_index = min(attempt_number - 1, len(active_strategies) - 1)
+            strategy = active_strategies[strategy_index]
             failure_type = self.classifier(
                 final_result.command,
                 final_result.stdout,

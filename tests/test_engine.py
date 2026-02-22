@@ -152,6 +152,22 @@ class SeniorAgentTests(unittest.TestCase):
         self.assertIn("Reached max attempts (2)", report.blocked_reason or "")
         self.assertEqual(executor.calls, 1)
 
+    def test_reuses_single_strategy_across_max_attempts(self) -> None:
+        executor = FakeExecutor([CommandResult("cmd", 1, "", "Traceback")])
+        strategy = StaticStrategy("single-noop", FixOutcome(applied=False, note="skip"))
+        agent = SeniorAgent(max_attempts=3, executor=executor)
+
+        report = agent.heal("python app.py", [strategy])
+
+        self.assertFalse(report.success)
+        self.assertEqual(len(report.attempts), 3)
+        self.assertEqual(
+            [attempt.strategy_name for attempt in report.attempts],
+            ["single-noop", "single-noop", "single-noop"],
+        )
+        self.assertIn("Reached max attempts (3)", report.blocked_reason or "")
+        self.assertEqual(executor.calls, 1)
+
     def test_reports_missing_strategies_when_command_fails(self) -> None:
         executor = FakeExecutor([CommandResult("cmd", 1, "", "Compilation failed")])
         agent = SeniorAgent(executor=executor)

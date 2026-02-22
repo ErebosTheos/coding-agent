@@ -21,6 +21,7 @@ ENV/
 .coverage.*
 htmlcov/
 
+
 # Packaging/build artifacts
 build/
 dist/
@@ -36,4 +37,5 @@ pip-wheel-metadata/
 
 # OS files
 .DS_Store
+Projects/
 Thumbs.db

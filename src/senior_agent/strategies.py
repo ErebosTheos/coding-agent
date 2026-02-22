@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import difflib
 import logging
 import re
@@ -123,6 +124,7 @@ class LLMStrategy:
     """Ask an LLM for a full-file fix using error-driven repository context."""
 
     llm_client: LLMClient
+    fallback_llm_clients: tuple[LLMClient, ...] = ()
     name: str = "llm_strategy"
     allowed_failures: set[FailureType] | None = None
     max_context_files: int = 3
@@ -154,6 +156,8 @@ class LLMStrategy:
             raise ValueError("context_chunk_radius must be >= 0.")
         if self.max_chunk_line_multiplier <= 1.0:
             raise ValueError("max_chunk_line_multiplier must be > 1.0.")
+        if any(client is self.llm_client for client in self.fallback_llm_clients):
+            raise ValueError("fallback_llm_clients must not include the primary llm_client.")
 
     def apply(self, context: FailureContext) -> FixOutcome:
         """Apply an LLM-proposed fix to the primary error-referenced file."""
@@ -233,7 +237,7 @@ class LLMStrategy:
             chunk_radius=self.context_chunk_radius,
         )
         try:
-            llm_output = self.llm_client.generate_fix(prompt)
+            llm_output = self._generate_fix_with_fallback(prompt)
         except LLMClientError as exc:
             logger.warning("LLM strategy failed: strategy=%s error=%s", self.name, exc)
             return FixOutcome(applied=False, note=f"LLM error: {exc}")
@@ -608,6 +612,55 @@ class LLMStrategy:
         if fence_match:
             return fence_match.group("code")
         return raw_output
+
+    def _generate_fix_with_fallback(self, prompt: str) -> str:
+        clients: tuple[LLMClient, ...] = (self.llm_client, *self.fallback_llm_clients)
+        if len(clients) == 1:
+            return self.llm_client.generate_fix(prompt)
+
+        failures: list[Exception] = []
+        executor = ThreadPoolExecutor(max_workers=len(clients))
+        wait_for_remaining = True
+        try:
+            futures = {
+                executor.submit(client.generate_fix, prompt): index
+                for index, client in enumerate(clients)
+            }
+            for future in as_completed(futures):
+                try:
+                    output = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    failures.append(exc)
+                    continue
+
+                for pending in futures:
+                    if pending is not future:
+                        pending.cancel()
+                wait_for_remaining = False
+                executor.shutdown(wait=False, cancel_futures=True)
+                return output
+        finally:
+            if wait_for_remaining:
+                executor.shutdown(wait=True, cancel_futures=True)
+
+        llm_failures = [
+            failure
+            for failure in failures
+            if isinstance(failure, LLMClientError)
+        ]
+        if llm_failures:
+            first_error = llm_failures[0]
+            details = " | ".join(str(error) for error in llm_failures[:3])
+            raise LLMClientError(f"All configured LLM clients failed: {details}") from first_error
+
+        if failures:
+            first_error = failures[0]
+            details = " | ".join(str(error) for error in failures[:3])
+            raise LLMClientError(
+                f"All configured LLM clients failed with unexpected errors: {details}"
+            ) from first_error
+
+        raise LLMClientError("All configured LLM clients failed without detailed error output.")
 
 
 @dataclass(frozen=True)

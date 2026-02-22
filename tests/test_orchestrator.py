@@ -248,6 +248,155 @@ class MultiAgentOrchestratorTests(unittest.TestCase):
             self.assertTrue(result)
             self.assertEqual(executor.command_calls, ["python -m unittest discover -s tests -v"])
 
+    def test_autodetects_validation_commands_when_plan_has_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            (workspace / "tests").mkdir(parents=True, exist_ok=True)
+            planner = StaticPlanner(
+                plan=ImplementationPlan(
+                    feature_name="Autodetect validation",
+                    summary="Create one file with no explicit validation commands.",
+                    new_files=["module.py"],
+                    modified_files=[],
+                    steps=[],
+                    validation_commands=[],
+                    design_guidance="",
+                )
+            )
+            llm = QueueLLMClient(responses=["VALUE = 3\n"])
+            autodetected_command = "python -m unittest discover -s tests -v"
+            executor = ScriptedExecutor(
+                command_results={
+                    autodetected_command: [
+                        CommandResult(
+                            command=autodetected_command,
+                            return_code=0,
+                            stdout="ok",
+                            stderr="",
+                        )
+                    ]
+                }
+            )
+            orchestrator = MultiAgentOrchestrator(
+                llm_client=llm,
+                planner=planner,
+                executor=executor,
+                test_writer=NoopTestWriter(),
+                dependency_manager=StubDependencyManager(),
+                style_mimic=StubStyleMimic(),
+            )
+
+            result = orchestrator.execute_feature_request(
+                requirement="Build",
+                codebase_summary="Summary",
+                workspace=workspace,
+            )
+
+            self.assertTrue(result)
+            self.assertEqual(executor.command_calls, [autodetected_command])
+
+    def test_fails_when_no_validation_commands_can_be_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            planner = StaticPlanner(
+                plan=ImplementationPlan(
+                    feature_name="No validations",
+                    summary="No validation commands and no detectable project tooling.",
+                    new_files=["module.py"],
+                    modified_files=[],
+                    steps=[],
+                    validation_commands=[],
+                    design_guidance="",
+                )
+            )
+            llm = QueueLLMClient(responses=["VALUE = 4\n"])
+            orchestrator = MultiAgentOrchestrator(
+                llm_client=llm,
+                planner=planner,
+                test_writer=NoopTestWriter(),
+                dependency_manager=StubDependencyManager(),
+                style_mimic=StubStyleMimic(),
+            )
+
+            result = orchestrator.execute_feature_request(
+                requirement="Build",
+                codebase_summary="Summary",
+                workspace=workspace,
+            )
+
+            self.assertFalse(result)
+            self.assertEqual(len(llm.prompts), 0)
+
+    def test_adds_symbol_graph_impacted_validation_for_modified_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            source_dir = workspace / "src"
+            test_dir = workspace / "tests"
+            source_dir.mkdir(parents=True, exist_ok=True)
+            test_dir.mkdir(parents=True, exist_ok=True)
+
+            core_file = source_dir / "core.py"
+            core_file.write_text(
+                "def process() -> int:\n"
+                "    return 1\n",
+                encoding="utf-8",
+            )
+            (source_dir / "service.py").write_text(
+                "from core import process\n"
+                "VALUE = process()\n",
+                encoding="utf-8",
+            )
+            (test_dir / "test_service.py").write_text(
+                "import unittest\n\n"
+                "class ServiceTests(unittest.TestCase):\n"
+                "    def test_value(self) -> None:\n"
+                "        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+
+            planner = StaticPlanner(
+                plan=ImplementationPlan(
+                    feature_name="Core update",
+                    summary="Modify core implementation only.",
+                    new_files=[],
+                    modified_files=["src/core.py"],
+                    steps=[],
+                    validation_commands=[],
+                    design_guidance="",
+                )
+            )
+            llm = QueueLLMClient(responses=["def process() -> int:\n    return 2\n"])
+            validation_command = "python -m unittest discover -s tests -p test_service.py"
+            executor = ScriptedExecutor(
+                command_results={
+                    validation_command: [
+                        CommandResult(
+                            command=validation_command,
+                            return_code=0,
+                            stdout="ok",
+                            stderr="",
+                        )
+                    ]
+                }
+            )
+            orchestrator = MultiAgentOrchestrator(
+                llm_client=llm,
+                planner=planner,
+                executor=executor,
+                dependency_manager=StubDependencyManager(),
+                style_mimic=StubStyleMimic(),
+            )
+
+            result = orchestrator.execute_feature_request(
+                requirement="Update process",
+                codebase_summary="Python app with unit tests.",
+                workspace=workspace,
+            )
+
+            self.assertTrue(result)
+            self.assertEqual(executor.command_calls, [validation_command])
+            self.assertIn("return 2", core_file.read_text(encoding="utf-8"))
+
     def test_rolls_back_created_and_modified_files_when_validation_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             workspace = Path(tmp_dir)

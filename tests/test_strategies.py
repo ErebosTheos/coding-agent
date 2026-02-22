@@ -1,5 +1,6 @@
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -23,6 +24,21 @@ class FakeLLMClient:
 
     def generate_fix(self, prompt: str) -> str:
         self.prompts.append(prompt)
+        if self.error is not None:
+            raise self.error
+        return self.response
+
+
+class DelayedLLMClient:
+    def __init__(self, *, delay_seconds: float, response: str | None = None, error: Exception | None = None) -> None:
+        self.delay_seconds = delay_seconds
+        self.response = response or ""
+        self.error = error
+        self.prompts: list[str] = []
+
+    def generate_fix(self, prompt: str) -> str:
+        self.prompts.append(prompt)
+        time.sleep(self.delay_seconds)
         if self.error is not None:
             raise self.error
         return self.response
@@ -149,6 +165,46 @@ class LLMStrategyTests(unittest.TestCase):
             self.assertFalse(outcome.applied)
             self.assertIn("LLM error", outcome.note)
             self.assertEqual(target_file.read_text(encoding="utf-8"), "x = 1\n")
+
+    def test_parallel_fallback_uses_first_successful_client(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            target_file = workspace / "file.py"
+            target_file.write_text("x = 1\n", encoding="utf-8")
+
+            slow_failing = DelayedLLMClient(
+                delay_seconds=0.35,
+                error=LLMClientError("primary unavailable"),
+            )
+            fast_success = DelayedLLMClient(
+                delay_seconds=0.05,
+                response="x = 2\n",
+            )
+            strategy = LLMStrategy(
+                llm_client=slow_failing,
+                fallback_llm_clients=(fast_success,),
+            )
+            context = FailureContext(
+                command_result=CommandResult(
+                    "python file.py",
+                    1,
+                    "",
+                    "file.py:1: error",
+                ),
+                failure_type=FailureType.RUNTIME_EXCEPTION,
+                workspace=workspace,
+                attempt_number=1,
+            )
+
+            started = time.monotonic()
+            outcome = strategy.apply(context)
+            elapsed = time.monotonic() - started
+
+            self.assertTrue(outcome.applied)
+            self.assertEqual(target_file.read_text(encoding="utf-8"), "x = 2\n")
+            self.assertEqual(len(slow_failing.prompts), 1)
+            self.assertEqual(len(fast_success.prompts), 1)
+            self.assertLess(elapsed, 0.3)
 
     def test_includes_top_three_files_in_prompt_context_buffer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

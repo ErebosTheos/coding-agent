@@ -28,10 +28,11 @@ class DependencyManagerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             workspace = Path(tmp_dir)
             (workspace / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+            pip_command = f"{sys.executable} -m pip install requests"
             executor = ScriptedExecutor(
                 command_results={
-                    "pip install requests": [
-                        CommandResult(command="pip install requests", return_code=0, stdout="ok", stderr=""),
+                    pip_command: [
+                        CommandResult(command=pip_command, return_code=0, stdout="ok", stderr=""),
                     ]
                 }
             )
@@ -46,7 +47,7 @@ class DependencyManagerTests(unittest.TestCase):
             fixed = manager.check_and_fix_dependencies(failure, workspace)
 
             self.assertTrue(fixed)
-            self.assertEqual(executor.command_calls, ["pip install requests"])
+            self.assertEqual(executor.command_calls, [pip_command])
 
     def test_installs_missing_node_module_with_npm(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

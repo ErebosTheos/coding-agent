@@ -1,27 +1,25 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
 import shlex
+import shutil
 from pathlib import Path
 
 from senior_agent.dependency_manager import DependencyManager
 from senior_agent.engine import Executor, SeniorAgent, run_shell_command
 from senior_agent.llm_client import LLMClient, LLMClientError
 from senior_agent.models import CommandResult, FileRollback, ImplementationPlan, SessionReport
+from senior_agent.patterns import CODE_FENCE_PATTERN
 from senior_agent.planner import FeaturePlanner
+from senior_agent.symbol_graph import SymbolGraph
 from senior_agent.style_mimic import StyleMimic
 from senior_agent.test_writer import TestWriter
 from senior_agent.utils import is_within_workspace
 from senior_agent.visual_reporter import VisualReporter
 
 logger = logging.getLogger(__name__)
-
-_CODE_FENCE_PATTERN = re.compile(
-    r"```(?:[A-Za-z0-9_+-]+)?\n(?P<code>[\s\S]*?)```",
-    re.MULTILINE,
-)
-
 
 class MultiAgentOrchestrator:
     """Coordinate plan -> implement -> verify flow for feature requests."""
@@ -35,14 +33,20 @@ class MultiAgentOrchestrator:
         test_writer: TestWriter | None = None,
         dependency_manager: DependencyManager | None = None,
         style_mimic: StyleMimic | None = None,
+        symbol_graph: SymbolGraph | None = None,
+        architect_llm_client: LLMClient | None = None,
+        reviewer_llm_client: LLMClient | None = None,
     ) -> None:
         self.llm_client = llm_client
+        self.architect_llm_client = architect_llm_client
+        self.reviewer_llm_client = reviewer_llm_client
         self.planner = planner
         self.executor = executor
         self.visual_reporter = visual_reporter or VisualReporter()
         self.test_writer = test_writer or TestWriter(llm_client=llm_client)
         self.dependency_manager = dependency_manager or DependencyManager(executor=executor)
         self.style_mimic = style_mimic or StyleMimic()
+        self.symbol_graph = symbol_graph or SymbolGraph()
         self._rollback_agent = SeniorAgent(max_attempts=1, executor=executor)
         self._environment_workspace = Path(".").resolve()
 
@@ -107,7 +111,6 @@ class MultiAgentOrchestrator:
             )
             return False
 
-        self._log_plan(plan)
         self.test_writer.workspace = workspace_root
 
         try:
@@ -116,10 +119,23 @@ class MultiAgentOrchestrator:
             logger.exception("Style inference failed; falling back to default style guidance: %s", exc)
             style_rules = "Style: preserve existing conventions."
 
+        try:
+            self.symbol_graph.build_graph(workspace_root)
+            plan = self._augment_plan_with_symbol_graph_validation(
+                plan=plan,
+                workspace_root=workspace_root,
+            )
+        except Exception as exc:  # pragma: no cover - defensive guardrail
+            logger.exception(
+                "Symbol graph augmentation failed; continuing without proactive impact validation: %s",
+                exc,
+            )
+
         plan, generated_file_overrides, test_generation_note = self._augment_plan_with_generated_tests(
             plan=plan,
             workspace_root=workspace_root,
         )
+        self._log_plan(plan)
         if test_generation_note is not None:
             blocked_reason = test_generation_note
             final_result = CommandResult(
@@ -142,6 +158,50 @@ class MultiAgentOrchestrator:
             return False
 
         validation_commands = tuple(command.strip() for command in plan.validation_commands if command.strip())
+        if not validation_commands:
+            inferred_validation_commands = tuple(
+                self._autodetect_validation_commands(workspace_root)
+            )
+            if inferred_validation_commands:
+                validation_commands = inferred_validation_commands
+                plan = ImplementationPlan(
+                    feature_name=plan.feature_name,
+                    summary=plan.summary,
+                    new_files=list(plan.new_files),
+                    modified_files=list(plan.modified_files),
+                    steps=list(plan.steps),
+                    validation_commands=list(inferred_validation_commands),
+                    design_guidance=plan.design_guidance,
+                )
+                logger.info(
+                    "No validation commands in plan '%s'; using autodetected defaults: %s",
+                    plan.feature_name,
+                    ", ".join(validation_commands),
+                )
+            else:
+                blocked_reason = (
+                    "No validation commands were provided in the plan and no "
+                    "safe defaults could be detected."
+                )
+                final_result = CommandResult(
+                    command="validation-autodetect",
+                    return_code=1,
+                    stdout="",
+                    stderr=blocked_reason,
+                )
+                logger.error(blocked_reason)
+                self._emit_visual_summary(
+                    plan=plan,
+                    report=self._build_session_report(
+                        command=requirement,
+                        final_result=final_result,
+                        success=False,
+                        blocked_reason=blocked_reason,
+                    ),
+                    workspace_root=workspace_root,
+                )
+                return False
+
         success = False
         blocked_reason: str | None = None
         final_result = CommandResult(
@@ -237,17 +297,40 @@ class MultiAgentOrchestrator:
                 )
                 return False
 
-        if not validation_commands:
-            logger.info(
-                "No validation commands specified in plan '%s'; skipping verification.",
-                plan.feature_name,
+        if self.reviewer_llm_client is not None:
+            review_passed, review_note = self._run_gatekeeper_review(
+                plan=plan,
+                requirement=requirement,
+                workspace_root=workspace_root,
+                validation_commands=validation_commands,
+                final_result=final_result,
             )
-            final_result = CommandResult(
-                command="validation-skip",
-                return_code=0,
-                stdout="No validation commands configured in plan.",
-                stderr="",
-            )
+            if review_note:
+                logger.info("Gatekeeper review note: %s", review_note)
+            if not review_passed:
+                blocked_reason = f"Gatekeeper review rejected changes: {review_note}"
+                final_result = CommandResult(
+                    command="gatekeeper-review",
+                    return_code=1,
+                    stdout="",
+                    stderr=blocked_reason,
+                )
+                self._critical_failure_and_rollback(
+                    reason=blocked_reason,
+                    workspace_root=workspace_root,
+                    rollback_entries=tuple(rollback_map.values()),
+                )
+                self._emit_visual_summary(
+                    plan=plan,
+                    report=self._build_session_report(
+                        command=requirement,
+                        final_result=final_result,
+                        success=success,
+                        blocked_reason=blocked_reason,
+                    ),
+                    workspace_root=workspace_root,
+                )
+                return False
 
         success = True
         self._emit_visual_summary(
@@ -351,6 +434,138 @@ class MultiAgentOrchestrator:
 
         logger.info("Created new file: %s", relative_target)
         return True, None
+
+    def _augment_plan_with_symbol_graph_validation(
+        self,
+        *,
+        plan: ImplementationPlan,
+        workspace_root: Path,
+    ) -> ImplementationPlan:
+        if not plan.modified_files:
+            return plan
+
+        impacted_test_files = self._discover_impacted_test_files(
+            modified_files=plan.modified_files,
+            workspace_root=workspace_root,
+        )
+        if not impacted_test_files:
+            return plan
+
+        proactive_commands = self.test_writer.build_validation_commands(impacted_test_files)
+        if not proactive_commands:
+            return plan
+
+        merged_validation_commands = list(plan.validation_commands)
+        added_commands = 0
+        for command in proactive_commands:
+            cleaned = command.strip()
+            if cleaned and cleaned not in merged_validation_commands:
+                merged_validation_commands.append(cleaned)
+                added_commands += 1
+
+        if added_commands == 0:
+            return plan
+
+        logger.info(
+            "Symbol graph added proactive validation commands: impacted_tests=%s added_commands=%s",
+            len(impacted_test_files),
+            added_commands,
+        )
+        return ImplementationPlan(
+            feature_name=plan.feature_name,
+            summary=plan.summary,
+            new_files=list(plan.new_files),
+            modified_files=list(plan.modified_files),
+            steps=list(plan.steps),
+            validation_commands=merged_validation_commands,
+            design_guidance=plan.design_guidance,
+        )
+
+    def _discover_impacted_test_files(
+        self,
+        *,
+        modified_files: list[str],
+        workspace_root: Path,
+    ) -> list[str]:
+        impacted_tests: list[str] = []
+        seen_tests: set[str] = set()
+
+        for raw_modified_file in modified_files:
+            resolved_modified = self._resolve_target_path(workspace_root, raw_modified_file)
+            if resolved_modified is None:
+                continue
+
+            symbols = self.symbol_graph.get_defined_symbols(resolved_modified)
+            if not symbols:
+                continue
+
+            for symbol_name in symbols:
+                dependent_files = self.symbol_graph.get_dependents(
+                    resolved_modified,
+                    symbol_name,
+                )
+                for dependent_file in dependent_files:
+                    candidate_paths = self._candidate_test_paths_for_source(
+                        source_file=dependent_file,
+                        workspace_root=workspace_root,
+                    )
+                    for candidate in candidate_paths:
+                        if candidate in seen_tests:
+                            continue
+                        seen_tests.add(candidate)
+                        impacted_tests.append(candidate)
+
+        return impacted_tests
+
+    def _candidate_test_paths_for_source(
+        self,
+        *,
+        source_file: Path,
+        workspace_root: Path,
+    ) -> list[str]:
+        if not is_within_workspace(workspace_root, source_file):
+            return []
+        if not source_file.exists() or not source_file.is_file():
+            return []
+
+        suffix = source_file.suffix.lower()
+        stem = source_file.stem
+        candidates: list[Path] = []
+
+        if suffix == ".py":
+            candidates.extend(
+                [
+                    workspace_root / "tests" / f"test_{stem}.py",
+                    source_file.parent / f"test_{stem}.py",
+                ]
+            )
+        elif suffix in {".ts", ".tsx", ".js", ".jsx"}:
+            candidates.extend(
+                [
+                    workspace_root / "tests" / f"{stem}.test{suffix}",
+                    source_file.parent / f"{stem}.test{suffix}",
+                ]
+            )
+        elif suffix == ".go":
+            candidates.extend(
+                [
+                    source_file.parent / f"{stem}_test.go",
+                    workspace_root / "tests" / f"{stem}_test.go",
+                ]
+            )
+        else:
+            return []
+
+        resolved_candidates: list[str] = []
+        for candidate in candidates:
+            resolved = candidate.resolve()
+            if not is_within_workspace(workspace_root, resolved):
+                continue
+            if not resolved.exists() or not resolved.is_file():
+                continue
+            relative = resolved.relative_to(workspace_root).as_posix()
+            resolved_candidates.append(relative)
+        return resolved_candidates
 
     def _augment_plan_with_generated_tests(
         self,
@@ -593,7 +808,7 @@ class MultiAgentOrchestrator:
     @staticmethod
     def _normalize_generated_content(raw_output: str) -> str:
         stripped = raw_output.strip()
-        match = _CODE_FENCE_PATTERN.search(stripped)
+        match = CODE_FENCE_PATTERN.search(stripped)
         if match:
             return match.group("code").strip()
         return stripped
@@ -622,11 +837,7 @@ class MultiAgentOrchestrator:
                 continue
             seen_binaries.add(binary)
 
-            lookup = run_shell_command(
-                f"which {shlex.quote(binary)}",
-                self._environment_workspace,
-            )
-            if lookup.return_code != 0 or not lookup.stdout.strip():
+            if shutil.which(binary) is None:
                 logger.critical(
                     "Missing validation binary required for orchestrator execution: binary=%s command=%s",
                     binary,
@@ -686,6 +897,63 @@ class MultiAgentOrchestrator:
 
         logger.info("All orchestrator validation commands passed (%s).", len(commands))
         return True, last_result
+
+    def _autodetect_validation_commands(self, workspace_root: Path) -> list[str]:
+        commands: list[str] = []
+        package_json = workspace_root / "package.json"
+        if package_json.exists() and package_json.is_file():
+            try:
+                payload = json.loads(package_json.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                payload = {}
+            scripts = payload.get("scripts") if isinstance(payload, dict) else None
+            if isinstance(scripts, dict):
+                if isinstance(scripts.get("test"), str):
+                    commands.append("npm test")
+                if isinstance(scripts.get("lint"), str):
+                    commands.append("npm run lint")
+
+        if (workspace_root / "go.mod").exists():
+            commands.append("go test ./...")
+        if (workspace_root / "Cargo.toml").exists():
+            commands.append("cargo test")
+        if self._has_pytest_config(workspace_root):
+            commands.append("pytest")
+        if (workspace_root / "tests").exists():
+            commands.append("python -m unittest discover -s tests -v")
+
+        unique_commands: list[str] = []
+        seen: set[str] = set()
+        for command in commands:
+            normalized = command.strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            unique_commands.append(normalized)
+        return unique_commands
+
+    @staticmethod
+    def _has_pytest_config(workspace_root: Path) -> bool:
+        if (workspace_root / "pytest.ini").exists():
+            return True
+
+        tox_ini = workspace_root / "tox.ini"
+        if tox_ini.exists():
+            try:
+                if "[pytest]" in tox_ini.read_text(encoding="utf-8"):
+                    return True
+            except (OSError, UnicodeDecodeError):
+                return False
+
+        pyproject = workspace_root / "pyproject.toml"
+        if pyproject.exists():
+            try:
+                if "[tool.pytest.ini_options]" in pyproject.read_text(encoding="utf-8"):
+                    return True
+            except (OSError, UnicodeDecodeError):
+                return False
+
+        return False
 
     def _build_session_report(
         self,
@@ -754,6 +1022,65 @@ class MultiAgentOrchestrator:
             return
         logger.info("Saved Mermaid summary: %s", output_path)
 
+    def _run_gatekeeper_review(
+        self,
+        *,
+        plan: ImplementationPlan,
+        requirement: str,
+        workspace_root: Path,
+        validation_commands: tuple[str, ...],
+        final_result: CommandResult,
+    ) -> tuple[bool, str]:
+        if self.reviewer_llm_client is None:
+            return True, "Gatekeeper review skipped (no reviewer configured)."
+
+        prompt = self._build_gatekeeper_review_prompt(
+            plan=plan,
+            requirement=requirement,
+            workspace_root=workspace_root,
+            validation_commands=validation_commands,
+            final_result=final_result,
+        )
+        try:
+            raw_review = self.reviewer_llm_client.generate_fix(prompt)
+        except LLMClientError as exc:
+            return True, f"Gatekeeper review unavailable due to LLM error: {exc}"
+        except Exception as exc:  # pragma: no cover - defensive guardrail
+            logger.exception("Unexpected gatekeeper review failure: %s", exc)
+            return True, f"Gatekeeper review unavailable due to unexpected error: {exc}"
+
+        normalized = self._normalize_generated_content(raw_review)
+        if not normalized.strip():
+            return True, "Gatekeeper returned empty review output."
+
+        try:
+            payload = json.loads(normalized)
+        except json.JSONDecodeError:
+            compact = " ".join(normalized.split())
+            return True, compact[:600]
+
+        if not isinstance(payload, dict):
+            return True, "Gatekeeper response was not a JSON object."
+
+        status_raw = str(payload.get("status", "pass")).strip().lower()
+        summary = str(payload.get("summary", "")).strip()
+        findings_raw = payload.get("findings")
+        findings: list[str] = []
+        if isinstance(findings_raw, list):
+            findings = [
+                str(item).strip()
+                for item in findings_raw
+                if isinstance(item, str) and item.strip()
+            ]
+
+        note = summary or "No summary provided."
+        if findings:
+            note = f"{note} Findings: {' | '.join(findings[:5])}"
+
+        if status_raw in {"fail", "failed", "block", "blocked", "reject", "rejected"}:
+            return False, note
+        return True, note
+
     @staticmethod
     def _build_new_file_prompt(
         plan: ImplementationPlan,
@@ -800,4 +1127,48 @@ class MultiAgentOrchestrator:
             "--- BEGIN CURRENT FILE ---\n"
             f"{current_content}\n"
             "--- END CURRENT FILE ---\n"
+        )
+
+    @staticmethod
+    def _build_gatekeeper_review_prompt(
+        *,
+        plan: ImplementationPlan,
+        requirement: str,
+        workspace_root: Path,
+        validation_commands: tuple[str, ...],
+        final_result: CommandResult,
+    ) -> str:
+        validations = "\n".join(f"- {command}" for command in validation_commands)
+        if not validations:
+            validations = "- No validation commands were provided."
+        changed_files = "\n".join(
+            f"- {path}" for path in [*plan.new_files, *plan.modified_files]
+        ) or "- No file changes were listed in the plan."
+
+        combined_output = final_result.combined_output
+        if len(combined_output) > 3000:
+            combined_output = f"{combined_output[:3000]}\n...[truncated]"
+
+        return (
+            "Role: Chief Architect & Senior Reviewer (Gatekeeper).\n"
+            "Task: Audit this implementation result for security, performance, reliability, "
+            "and idiomatic consistency.\n"
+            "Return ONLY one JSON object with this schema:\n"
+            "{\n"
+            '  "status": "pass|fail",\n'
+            '  "summary": "string",\n'
+            '  "findings": ["string"]\n'
+            "}\n\n"
+            f"Requirement: {requirement}\n"
+            f"Workspace: {workspace_root}\n"
+            f"Feature: {plan.feature_name}\n"
+            f"Summary: {plan.summary}\n\n"
+            "Planned changed files:\n"
+            f"{changed_files}\n\n"
+            "Validation commands:\n"
+            f"{validations}\n\n"
+            "Final validation result:\n"
+            f"- command: {final_result.command}\n"
+            f"- return_code: {final_result.return_code}\n"
+            f"- output:\n{combined_output}\n"
         )

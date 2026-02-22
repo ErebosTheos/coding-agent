@@ -81,15 +81,29 @@ This roadmap defines the "Senior Product Engineer" evolution through a specializ
 
 ---
 
-## 🎯 Trinity Prompt Styling (The "Sharp" Templates)
+## ⚡ Breaking the Limits (The Tier 4 Upgrade)
 
-### 🟢 From Gemini (Planner) to Codex (Developer)
-> **Mandate:** "Execution Focus. No chatter."
-> **Prompt:** "Act as Lead Developer. Implement the `LLMStrategy.apply` method. It must accept the top 3 files from `stderr`, extract their content, and build a unified prompt. Use the `is_within_workspace` utility for safety. Return ONLY the code."
+This section defines the technical path to overcome the agent's current "Hard Limits."
 
-### 🔵 From Gemini (Planner) to Co-pilot (Reviewer)
-> **Mandate:** "Security & Optimization Audit."
-> **Prompt:** "Review the following code from Codex. Identify potential memory leaks in the file-reading loop and check for O(N^2) complexity in the regex matching. Suggest 3 specific optimizations."
+### 1. Limit: Myopic Symbol Graph (Python-Only)
+- **Breakthrough:** **LSP (Language Server Protocol) Integration.**
+- **Strategy:** Instead of using the `ast` module, integrate with `pyright` or `tsserver`. This allows the agent to use the same "Intelligence" your IDE uses to map cross-file dependencies in any language.
+
+### 2. Limit: No Visual UI Verification
+- **Breakthrough:** **Vision-LLM Loop (Playwright + Gemini Vision).**
+- **Strategy:** Add a `VisualLinter` module. It uses Playwright to take a screenshot of the app on localhost, sends it to Gemini (Vision), and asks: "Does this UI match the design guidance?" If not, it triggers a "Visual Healing" loop.
+
+### 3. Limit: No External Systems Interaction
+- **Breakthrough:** **Tool-Use (MCP / Plugin System).**
+- **Strategy:** Enable "Sandboxed Tool Access." Give the agent limited access to `aws-cli` or `terraform`. The orchestrator would treat a "Cloud Deploy" as just another `validation_command`.
+
+### 4. Limit: Missing "Brand" Context
+- **Breakthrough:** **RAG (Retrieval-Augmented Generation) Design Library.**
+- **Strategy:** Add a `docs/design_system.md` to the workspace. The `StyleMimic` would be upgraded to read this file and treat it as a "High-Priority Constraint" for all UI generation.
+
+### 5. Limit: Giving Up (Bounded Logic)
+- **Breakthrough:** **Long-Horizon Memory (Checkpoint Branching).**
+- **Strategy:** Instead of a simple loop, the orchestrator could "Branch." If Attempt 1 fails, it doesn't just try Attempt 2; it saves the state of Attempt 1 and tries a completely different architectural path, comparing both outcomes at the end.
 
 ---
 

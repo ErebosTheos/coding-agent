@@ -10,6 +10,7 @@ from senior_agent.models import ImplementationPlan
 _JSON_OBJECT_PROMPT_SUFFIX: Final[str] = (
     "Return ONLY one JSON object. Do not include markdown fences or extra prose."
 )
+_MAX_PLANNED_FILE_CHANGES: Final[int] = 50
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,7 @@ class FeaturePlanner:
             '  "new_files": ["string"],\n'
             '  "modified_files": ["string"],\n'
             '  "steps": ["string"],\n'
+            '  "validation_commands": ["string"],\n'
             '  "design_guidance": "string"\n'
             "}\n\n"
             "Requirement:\n"
@@ -69,4 +71,12 @@ class FeaturePlanner:
             ) from exc
         if not isinstance(payload, dict):
             raise ValueError("LLM feature plan response must be a JSON object.")
-        return ImplementationPlan.from_dict(payload)
+
+        plan = ImplementationPlan.from_dict(payload)
+        total_file_changes = len(plan.new_files) + len(plan.modified_files)
+        if total_file_changes > _MAX_PLANNED_FILE_CHANGES:
+            raise ValueError(
+                "LLM feature plan exceeds safe file-change limit: "
+                f"{total_file_changes} files (max {_MAX_PLANNED_FILE_CHANGES})."
+            )
+        return plan

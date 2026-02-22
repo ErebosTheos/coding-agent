@@ -206,8 +206,6 @@ class GeminiCLIClient:
             prompt,
             "--output-format",
             "text",
-            "--approval-mode",
-            "plan",
         ]
         if self.model:
             command.extend(["--model", self.model])

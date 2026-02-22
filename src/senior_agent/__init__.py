@@ -32,6 +32,7 @@ from senior_agent.strategies import (
 from senior_agent.planner import FeaturePlanner
 from senior_agent.orchestrator import MultiAgentOrchestrator
 from senior_agent.style_mimic import StyleMimic
+from senior_agent.symbol_graph import SymbolGraph
 from senior_agent.test_writer import TestWriter
 
 SelfHealingAgent = SeniorAgent
@@ -50,6 +51,7 @@ __all__ = [
     "TestWriter",
     "DependencyManager",
     "StyleMimic",
+    "SymbolGraph",
     "MultiAgentOrchestrator",
     "SeniorAgent",
     "SelfHealingAgent",

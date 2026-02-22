@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import re
 import shlex
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -126,13 +127,13 @@ class DependencyManager:
         if candidate.ecosystem == "node" and has_node_project:
             return f"npm install {dependency}"
         if candidate.ecosystem == "python" and has_python_project:
-            return f"pip install {dependency}"
+            return f"{shlex.quote(sys.executable)} -m pip install {dependency}"
 
         # Fallback to environment inference when ecosystem hints are weak.
         if has_node_project:
             return f"npm install {dependency}"
         if has_python_project:
-            return f"pip install {dependency}"
+            return f"{shlex.quote(sys.executable)} -m pip install {dependency}"
         return None
 
     @staticmethod

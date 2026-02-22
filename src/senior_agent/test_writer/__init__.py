@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,11 +8,7 @@ from typing import Iterable
 
 from senior_agent.llm_client import LLMClient
 from senior_agent.models import ImplementationPlan
-
-_CODE_FENCE_PATTERN = re.compile(
-    r"```(?:[A-Za-z0-9_+-]+)?\n(?P<code>[\s\S]*?)```",
-    re.MULTILINE,
-)
+from senior_agent.patterns import CODE_FENCE_PATTERN
 
 
 @dataclass
@@ -140,7 +135,7 @@ class TestWriter:
     @staticmethod
     def _normalize_generated_content(raw_output: str) -> str:
         stripped = raw_output.strip()
-        match = _CODE_FENCE_PATTERN.search(stripped)
+        match = CODE_FENCE_PATTERN.search(stripped)
         if match:
             return match.group("code").strip()
         return stripped

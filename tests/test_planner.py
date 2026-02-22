@@ -1,3 +1,4 @@
+import json
 import sys
 import unittest
 from dataclasses import dataclass, field
@@ -76,6 +77,27 @@ class FeaturePlannerTests(unittest.TestCase):
             planner.plan_feature(requirement="   ", codebase_summary="x")
         with self.assertRaisesRegex(ValueError, "codebase_summary must not be empty"):
             planner.plan_feature(requirement="x", codebase_summary="   ")
+
+    def test_plan_feature_rejects_excessive_file_change_count(self) -> None:
+        new_files = [f"src/file_{index}.py" for index in range(51)]
+        response = json.dumps(
+            {
+                "feature_name": "LargePlan",
+                "summary": "Too many files",
+                "new_files": new_files,
+                "modified_files": [],
+                "steps": ["step"],
+                "validation_commands": [],
+                "design_guidance": "none",
+            }
+        )
+        planner = FeaturePlanner(llm_client=FakeLLMClient(response=response))
+
+        with self.assertRaisesRegex(ValueError, "file-change limit"):
+            planner.plan_feature(
+                requirement="Implement huge feature",
+                codebase_summary="Python package",
+            )
 
 
 if __name__ == "__main__":
