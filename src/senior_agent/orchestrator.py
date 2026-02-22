@@ -5,9 +5,9 @@ import re
 import shlex
 from pathlib import Path
 
-from self_healing_agent.llm_client import LLMClient, LLMClientError
 from senior_agent.dependency_manager import DependencyManager
 from senior_agent.engine import Executor, SeniorAgent, run_shell_command
+from senior_agent.llm_client import LLMClient, LLMClientError
 from senior_agent.models import CommandResult, FileRollback, ImplementationPlan, SessionReport
 from senior_agent.planner import FeaturePlanner
 from senior_agent.style_mimic import StyleMimic

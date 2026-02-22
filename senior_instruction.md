@@ -41,33 +41,40 @@
 
 ---
 
-## 🚀 ACTIVE TASK: Phase 6 - The Style Mimic
+## 🚀 BACKLOG: Phase 6 - The Style Mimic (COMPLETED)
 **Objective:** Ensure the agent writes idiomatic code that matches the project's existing style, patterns, and conventions.
 
+---
+
+## 🚀 BACKLOG: Legacy Modernization (Migration) (COMPLETED)
+**Objective:** Fully migrate the legacy `self_healing_agent` logic into the new `senior_agent` architecture. Deprecate the old package while ensuring all existing features are preserved and improved.
+
+---
+
+## 🚀 ACTIVE TASK: Phase 3 - The Symbol Graph (Contextual Awareness)
+**Objective:** Give the agent "X-Ray Vision" to understand project dependencies and call graphs, preventing regressions.
+
 ### 📋 Prompt for ChatGPT Codex (Lead Developer)
-*Copy this into Codex to build the style-inference logic:*
+*Copy this into Codex to build the static analysis logic:*
 
 > **Role:** Senior Lead Developer.
-> **Context:** We are building the `StyleMimic` module to ensure all AI-generated code matches the repository's local conventions.
-> **Task:** Implement the `StyleMimic` class in `src/senior_agent/style_mimic/__init__.py`.
+> **Context:** We are building the `SymbolGraph` module to provide global codebase awareness.
+> **Task:** Implement the `SymbolGraph` class in `src/senior_agent/symbol_graph/__init__.py`.
 > 
 > **1. Logic Requirements:**
-> - Implement a method `infer_project_style(workspace: Path) -> str`.
+> - Implement a method `build_graph(workspace: Path) -> None`.
 > - **Process:**
->   - Scan the workspace for up to 5 source files (focusing on the primary language of the project).
->   - **Analyze Patterns:**
->     - Indentation (Spaces vs Tabs, and the count).
->     - Quote Style (Single vs Double).
->     - Naming Conventions (camelCase, snake_case, PascalCase).
->     - Framework specific patterns (e.g., Arrow functions vs Function keywords in JS).
->   - **Framework Detection:** Identify if the project is using React, Vue, FastAPI, Django, etc.
-> - **Output:** A concise, declarative string summarizing the style rules (e.g., "Style: 4-space indent, snake_case names, double quotes, FastAPI patterns").
+>   - Scan the workspace for source files (`.py`, `.ts`, etc.).
+>   - Parse files to extract symbols (classes, functions) and their references (who calls what).
+>   - **Initial Implementation:** Start with a robust Python parser (using the `ast` module) to map function definitions and calls.
+> - **Query Method:** `get_dependents(file_path: Path, symbol_name: str) -> list[Path]`.
+>   - Returns a list of files that depend on the given symbol.
 > 
 > **2. Integration Hook:**
 > - Update `src/senior_agent/orchestrator.py` to:
->   - Initialize `StyleMimic` in the constructor.
->   - In `execute_feature_request()`, *before* file generation:
->     - Call `self.style_mimic.infer_project_style()`.
->     - **Prompt Injection:** Inject the inferred style rules into the prompts for `_build_new_file_prompt` and `_build_modify_file_prompt`.
+>   - Initialize `SymbolGraph` in the constructor.
+>   - In `execute_feature_request()`, if a file is modified:
+>     - Query `SymbolGraph` for impacted files.
+>     - **Proactive Validation:** Automatically add tests for the impacted files to the `plan.validation_commands`.
 > 
-> **Constraint:** Return ONLY the code for `style_mimic/__init__.py` and the updated `orchestrator.py`.
+> **Constraint:** Return ONLY the code for `symbol_graph/__init__.py` and the updated `orchestrator.py`. Ensure it handles large repos gracefully.

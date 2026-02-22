@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from self_healing_agent.llm_client import LLMClient
+from senior_agent.llm_client import LLMClient
 from senior_agent.models import ImplementationPlan
 
 _CODE_FENCE_PATTERN = re.compile(

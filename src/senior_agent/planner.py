@@ -4,8 +4,8 @@ import json
 from dataclasses import dataclass
 from typing import Final
 
+from senior_agent.llm_client import LLMClient
 from senior_agent.models import ImplementationPlan
-from self_healing_agent.llm_client import LLMClient
 
 _JSON_OBJECT_PROMPT_SUFFIX: Final[str] = (
     "Return ONLY one JSON object. Do not include markdown fences or extra prose."

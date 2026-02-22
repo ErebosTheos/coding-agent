@@ -34,6 +34,9 @@ from senior_agent.orchestrator import MultiAgentOrchestrator
 from senior_agent.style_mimic import StyleMimic
 from senior_agent.test_writer import TestWriter
 
+SelfHealingAgent = SeniorAgent
+create_default_agent = create_default_senior_agent
+
 __all__ = [
     "AttemptRecord",
     "CommandResult",
@@ -49,7 +52,9 @@ __all__ = [
     "StyleMimic",
     "MultiAgentOrchestrator",
     "SeniorAgent",
+    "SelfHealingAgent",
     "create_default_senior_agent",
+    "create_default_agent",
     "LLMClient",
     "LLMClientError",
     "LLMTimeoutError",

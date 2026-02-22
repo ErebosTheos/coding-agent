@@ -8,6 +8,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 
 class CompatibilityShimTests(unittest.TestCase):
+    def test_senior_top_level_legacy_aliases_resolve(self) -> None:
+        from senior_agent import SelfHealingAgent, create_default_agent
+        from senior_agent.engine import SeniorAgent, create_default_senior_agent
+
+        self.assertIs(SelfHealingAgent, SeniorAgent)
+        self.assertIs(create_default_agent, create_default_senior_agent)
+
     def test_legacy_engine_aliases_map_to_senior_agent(self) -> None:
         from self_healing_agent.engine import SelfHealingAgent, create_default_agent
         from senior_agent.engine import SeniorAgent, create_default_senior_agent
