@@ -8,6 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from senior_agent.engine import SeniorAgent, create_default_senior_agent
+from senior_agent.llm_client import MultiCloudRouter
 from senior_agent.models import (
     CommandResult,
     FailureContext,
@@ -58,6 +59,7 @@ class ScriptedExecutor:
 class StaticStrategy:
     name: str
     outcome: FixOutcome
+    allowed_failures: set[FailureType] | None = None
     seen_failures: list[FailureType] = field(default_factory=list)
 
     def apply(self, context: FailureContext) -> FixOutcome:
@@ -353,6 +355,23 @@ class SeniorAgentTests(unittest.TestCase):
 
         self.assertEqual(len(agent.default_strategies), 1)
         self.assertIsInstance(agent.default_strategies[0], LLMStrategy)
+        self.assertIsInstance(agent.default_strategies[0].llm_client, MultiCloudRouter)
+
+    def test_create_default_senior_agent_can_disable_tiered_routing(self) -> None:
+        agent = create_default_senior_agent(
+            provider="codex",
+            workspace=Path.cwd(),
+            enable_tiered_routing=False,
+        )
+
+        self.assertEqual(len(agent.default_strategies), 1)
+        self.assertIsInstance(agent.default_strategies[0], LLMStrategy)
+        self.assertNotIsInstance(agent.default_strategies[0].llm_client, MultiCloudRouter)
+
+    def test_create_default_senior_agent_accepts_dual_provider_mode(self) -> None:
+        agent = create_default_senior_agent(provider="dual", workspace=Path.cwd())
+        self.assertEqual(len(agent.default_strategies), 1)
+        self.assertIsInstance(agent.default_strategies[0].llm_client, MultiCloudRouter)
 
     def test_create_default_senior_agent_rejects_unknown_provider(self) -> None:
         with self.assertRaises(ValueError):
@@ -439,6 +458,64 @@ class SeniorAgentTests(unittest.TestCase):
 
         self.assertTrue(report.success)
         self.assertEqual(report.final_result.command, "python -m ruff check .")
+
+    def test_verification_cache_reuses_duplicate_validation_commands(self) -> None:
+        executor = ScriptedExecutor(
+            {
+                "python -m pytest": [
+                    CommandResult("python -m pytest", 0, "ok", ""),
+                ],
+                "python -m ruff check .": [
+                    CommandResult("python -m ruff check .", 0, "lint ok", ""),
+                ],
+            }
+        )
+        agent = SeniorAgent(
+            executor=executor,
+            default_validation_commands=(
+                "python -m ruff check .",
+                "python -m ruff check .",
+            ),
+            enable_verification_cache=True,
+        )
+
+        report = agent.heal("python -m pytest")
+
+        self.assertTrue(report.success)
+        self.assertEqual(
+            executor.command_calls,
+            ["python -m pytest", "python -m ruff check ."],
+        )
+
+    def test_adaptive_strategy_ordering_prioritizes_matching_failure_type(self) -> None:
+        executor = FakeExecutor(
+            [
+                CommandResult("cmd", 1, "", "assertionerror"),
+                CommandResult("cmd", 0, "ok", ""),
+            ]
+        )
+        non_matching = StaticStrategy(
+            name="lint-only",
+            outcome=FixOutcome(applied=False, note="skip"),
+            allowed_failures={FailureType.LINT_TYPE_FAILURE},
+        )
+        matching = StaticStrategy(
+            name="test-fix",
+            outcome=FixOutcome(applied=True, note="patched"),
+            allowed_failures={FailureType.TEST_FAILURE},
+        )
+        agent = SeniorAgent(
+            max_attempts=1,
+            executor=executor,
+            adaptive_strategy_ordering=True,
+        )
+
+        report = agent.heal("python -m pytest", [non_matching, matching])
+
+        self.assertTrue(report.success)
+        self.assertEqual(len(report.attempts), 1)
+        self.assertEqual(report.attempts[0].strategy_name, "test-fix")
+        self.assertEqual(executor.calls, 2)
 
     def test_rolls_back_files_after_failed_verification(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -762,6 +839,60 @@ class SeniorAgentTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "missing compatibility metadata"):
                 resume_agent.resume(checkpoint_path=checkpoint_file, workspace=workspace)
+
+    def test_writes_and_loads_binary_checkpoint_format(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            checkpoint_file = workspace / "binary.chk"
+            seed_agent = SeniorAgent(
+                executor=FakeExecutor([CommandResult("python -m pytest", 0, "ok", "")]),
+                checkpoint_serialization_mode="binary",
+            )
+            seed_report = seed_agent.heal(
+                "python -m pytest",
+                workspace=workspace,
+                checkpoint_path=checkpoint_file,
+            )
+            self.assertTrue(seed_report.success)
+            self.assertTrue(checkpoint_file.exists())
+            self.assertTrue(
+                checkpoint_file.read_bytes().startswith(b"SENIOR_AGENT_CHECKPOINT_BIN_V1"),
+            )
+
+            class RaisingExecutor:
+                def __call__(self, command: str, workspace_path: Path) -> CommandResult:
+                    raise AssertionError("resume should not execute commands on successful checkpoint")
+
+            resume_agent = SeniorAgent(
+                executor=RaisingExecutor(),
+                checkpoint_serialization_mode="binary",
+            )
+            resumed = resume_agent.resume(checkpoint_path=checkpoint_file, workspace=workspace)
+            self.assertTrue(resumed.success)
+
+    def test_ab_checkpoint_writes_json_and_binary_companion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            checkpoint_file = workspace / "session.json"
+            agent = SeniorAgent(
+                executor=FakeExecutor([CommandResult("python -m pytest", 0, "ok", "")]),
+                checkpoint_serialization_mode="ab",
+            )
+            report = agent.heal(
+                "python -m pytest",
+                workspace=workspace,
+                checkpoint_path=checkpoint_file,
+            )
+            self.assertTrue(report.success)
+            self.assertTrue(checkpoint_file.exists())
+            binary_file = checkpoint_file.with_suffix(".json.bin")
+            self.assertTrue(binary_file.exists())
+            payload = json.loads(checkpoint_file.read_text(encoding="utf-8"))
+            self.assertEqual(payload.get("checkpoint_format"), "ab")
+
+    def test_rejects_unknown_checkpoint_serialization_mode(self) -> None:
+        with self.assertRaisesRegex(ValueError, "checkpoint_serialization_mode"):
+            SeniorAgent(checkpoint_serialization_mode="xml")
 
 
 if __name__ == "__main__":

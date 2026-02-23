@@ -1,0 +1,32 @@
+{
+  "error_taxonomy": {
+    "ContractMismatch": "Implementation deviates from node intent.",
+    "ValidationFailure": "Validation command failed."
+  },
+  "examples": [
+    {
+      "node_id": "final_verification",
+      "steps": [
+        "Execute the global validation command to ensure the server starts and serves the UI."
+      ],
+      "target_files": []
+    }
+  ],
+  "inputs": [
+    {
+      "name": "depends_on",
+      "type": "js_ui_bindings,readme_documentation"
+    }
+  ],
+  "invariants": [
+    "Modify only files listed in node new_files/modified_files.",
+    "Preserve dependency expectations from upstream nodes.",
+    "Implementation must follow the declared node steps."
+  ],
+  "node_id": "final_verification",
+  "outputs": [],
+  "public_api": [
+    "Validation command: python3 main.py & sleep 1 && curl -s http://localhost:8080 | grep -i 'calculator' && kill $!"
+  ],
+  "purpose": "Verify the full application lifecycle."
+}

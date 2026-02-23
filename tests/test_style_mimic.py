@@ -31,6 +31,8 @@ class StyleMimicTests(unittest.TestCase):
             self.assertIn("snake_case names", summary)
             self.assertIn("double quotes", summary)
             self.assertIn("FastAPI patterns", summary)
+            self.assertIn("Architecture:", summary)
+            self.assertIn("FastAPI router/dependency flow", summary)
 
     def test_infers_react_style_for_javascript(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -44,8 +46,10 @@ class StyleMimicTests(unittest.TestCase):
             (source_dir / "App.jsx").write_text(
                 "import React from 'react';\n\n"
                 "export default function App() {\n"
+                "  const [count, setCount] = React.useState(0);\n"
                 "  const handleClick = () => {\n"
                 "    const localValue = 'ok';\n"
+                "    setCount(count + 1);\n"
                 "    return localValue;\n"
                 "  };\n"
                 "  return <button onClick={handleClick}>Run</button>;\n"
@@ -59,6 +63,30 @@ class StyleMimicTests(unittest.TestCase):
             self.assertIn("camelCase names", summary)
             self.assertIn("single quotes", summary)
             self.assertIn("React patterns", summary)
+            self.assertIn("React hooks-first components", summary)
+
+    def test_detects_pydantic_architecture_patterns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            source_dir = workspace / "src"
+            source_dir.mkdir(parents=True, exist_ok=True)
+            (source_dir / "models.py").write_text(
+                "from dataclasses import dataclass\n"
+                "from pydantic import BaseModel\n\n"
+                "@dataclass\n"
+                "class UserView:\n"
+                "    name: str\n\n"
+                "class UserDTO(BaseModel):\n"
+                "    id: int\n"
+                "    name: str\n",
+                encoding="utf-8",
+            )
+
+            summary = StyleMimic().infer_project_style(workspace)
+
+            self.assertIn("Architecture:", summary)
+            self.assertIn("Pydantic data models", summary)
+            self.assertIn("dataclass-oriented domain models", summary)
 
     def test_falls_back_when_workspace_is_missing(self) -> None:
         missing_path = Path("/tmp/this-style-mimic-path-should-not-exist-12345")

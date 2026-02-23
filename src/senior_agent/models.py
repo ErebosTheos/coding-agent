@@ -16,6 +16,14 @@ class FailureType(str, Enum):
     UNKNOWN = "unknown"
 
 
+class NodeStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCESS = "success"
+    FAILED = "failed"
+    EVICTED = "evicted"
+
+
 @dataclass(frozen=True)
 class CommandResult:
     command: str
@@ -73,6 +81,7 @@ class ImplementationPlan:
     steps: list[str] = field(default_factory=list)
     validation_commands: list[str] = field(default_factory=list)
     design_guidance: str = ""
+    dependency_graph: "DependencyGraph | None" = None
 
     def to_json(self, indent: int | None = 2) -> str:
         return json.dumps(
@@ -84,6 +93,9 @@ class ImplementationPlan:
                 "steps": list(self.steps),
                 "validation_commands": list(self.validation_commands),
                 "design_guidance": self.design_guidance,
+                "dependency_graph": (
+                    None if self.dependency_graph is None else self.dependency_graph.to_dict()
+                ),
             },
             indent=indent,
             sort_keys=True,
@@ -101,14 +113,44 @@ class ImplementationPlan:
         if not summary:
             raise ValueError("Implementation plan is missing required field: summary.")
 
+        graph_payload = payload.get("dependency_graph")
+        if graph_payload is None and isinstance(payload.get("nodes"), list):
+            graph_payload = {
+                "feature_name": feature_name,
+                "summary": summary,
+                "nodes": payload.get("nodes"),
+                "global_validation_commands": payload.get("validation_commands", []),
+            }
+        dependency_graph = (
+            DependencyGraph.from_dict(graph_payload)
+            if isinstance(graph_payload, dict)
+            else None
+        )
+
+        new_files = cls._coerce_string_list(payload.get("new_files"))
+        modified_files = cls._coerce_string_list(payload.get("modified_files"))
+        steps = cls._coerce_string_list(payload.get("steps"))
+        validation_commands = cls._coerce_string_list(payload.get("validation_commands"))
+
+        if dependency_graph is not None:
+            if not new_files:
+                new_files = dependency_graph.all_new_files()
+            if not modified_files:
+                modified_files = dependency_graph.all_modified_files()
+            if not steps:
+                steps = dependency_graph.all_steps()
+            if not validation_commands:
+                validation_commands = dependency_graph.global_validation_commands
+
         return cls(
             feature_name=feature_name,
             summary=summary,
-            new_files=cls._coerce_string_list(payload.get("new_files")),
-            modified_files=cls._coerce_string_list(payload.get("modified_files")),
-            steps=cls._coerce_string_list(payload.get("steps")),
-            validation_commands=cls._coerce_string_list(payload.get("validation_commands")),
+            new_files=new_files,
+            modified_files=modified_files,
+            steps=steps,
+            validation_commands=validation_commands,
             design_guidance=str(payload.get("design_guidance", "")).strip(),
+            dependency_graph=dependency_graph,
         )
 
     @staticmethod
@@ -120,6 +162,227 @@ class ImplementationPlan:
             for item in raw_value
             if isinstance(item, str) and item.strip()
         ]
+
+
+@dataclass(frozen=True)
+class ExecutionNode:
+    """Atomic graph node used by the parallel grid orchestrator."""
+
+    node_id: str
+    title: str
+    summary: str
+    new_files: list[str] = field(default_factory=list)
+    modified_files: list[str] = field(default_factory=list)
+    steps: list[str] = field(default_factory=list)
+    validation_commands: list[str] = field(default_factory=list)
+    depends_on: list[str] = field(default_factory=list)
+    contract_node: bool = False
+    shared_resources: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "node_id": self.node_id,
+            "title": self.title,
+            "summary": self.summary,
+            "new_files": list(self.new_files),
+            "modified_files": list(self.modified_files),
+            "steps": list(self.steps),
+            "validation_commands": list(self.validation_commands),
+            "depends_on": list(self.depends_on),
+            "contract_node": self.contract_node,
+            "shared_resources": list(self.shared_resources),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any], *, fallback_id: int) -> "ExecutionNode":
+        if not isinstance(payload, dict):
+            raise ValueError("Execution node payload must be an object.")
+        node_id = str(payload.get("node_id", "")).strip() or f"node_{fallback_id}"
+        title = str(payload.get("title", "")).strip() or node_id
+        summary = str(payload.get("summary", "")).strip() or title
+        if not node_id:
+            raise ValueError("Execution node is missing node_id.")
+
+        return cls(
+            node_id=node_id,
+            title=title,
+            summary=summary,
+            new_files=ImplementationPlan._coerce_string_list(payload.get("new_files")),
+            modified_files=ImplementationPlan._coerce_string_list(payload.get("modified_files")),
+            steps=ImplementationPlan._coerce_string_list(payload.get("steps")),
+            validation_commands=ImplementationPlan._coerce_string_list(
+                payload.get("validation_commands")
+            ),
+            depends_on=ImplementationPlan._coerce_string_list(payload.get("depends_on")),
+            contract_node=bool(payload.get("contract_node", False)),
+            shared_resources=ImplementationPlan._coerce_string_list(
+                payload.get("shared_resources")
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class DependencyGraph:
+    """Dependency graph describing node-level parallel execution plan."""
+
+    feature_name: str
+    summary: str
+    nodes: list[ExecutionNode] = field(default_factory=list)
+    global_validation_commands: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "feature_name": self.feature_name,
+            "summary": self.summary,
+            "nodes": [node.to_dict() for node in self.nodes],
+            "global_validation_commands": list(self.global_validation_commands),
+        }
+
+    def to_json(self, indent: int | None = 2) -> str:
+        return json.dumps(self.to_dict(), indent=indent, sort_keys=True)
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "DependencyGraph":
+        if not isinstance(payload, dict):
+            raise ValueError("Dependency graph payload must be an object.")
+        feature_name = str(payload.get("feature_name", "")).strip()
+        summary = str(payload.get("summary", "")).strip()
+        if not feature_name:
+            raise ValueError("Dependency graph is missing required field: feature_name.")
+        if not summary:
+            raise ValueError("Dependency graph is missing required field: summary.")
+
+        raw_nodes = payload.get("nodes")
+        if not isinstance(raw_nodes, list):
+            raise ValueError("Dependency graph is missing required field: nodes.")
+        nodes = [
+            ExecutionNode.from_dict(item, fallback_id=index)
+            for index, item in enumerate(raw_nodes, start=1)
+            if isinstance(item, dict)
+        ]
+        if not nodes:
+            raise ValueError("Dependency graph must include at least one node.")
+
+        graph = cls(
+            feature_name=feature_name,
+            summary=summary,
+            nodes=nodes,
+            global_validation_commands=ImplementationPlan._coerce_string_list(
+                payload.get("global_validation_commands")
+            ),
+        )
+        graph.validate()
+        return graph
+
+    def validate(self) -> None:
+        ids = [node.node_id for node in self.nodes]
+        duplicates = {node_id for node_id in ids if ids.count(node_id) > 1}
+        if duplicates:
+            raise ValueError(
+                "Dependency graph has duplicate node identifiers: "
+                + ", ".join(sorted(duplicates))
+            )
+
+        node_id_set = set(ids)
+        for node in self.nodes:
+            for dep in node.depends_on:
+                if dep not in node_id_set:
+                    raise ValueError(
+                        f"Dependency graph references unknown dependency '{dep}' for node '{node.node_id}'."
+                    )
+                if dep == node.node_id:
+                    raise ValueError(
+                        f"Dependency graph node '{node.node_id}' cannot depend on itself."
+                    )
+
+        # Kahn's algorithm for cycle detection.
+        indegree: dict[str, int] = {node.node_id: 0 for node in self.nodes}
+        adjacency: dict[str, set[str]] = {node.node_id: set() for node in self.nodes}
+        for node in self.nodes:
+            for dep in node.depends_on:
+                adjacency.setdefault(dep, set()).add(node.node_id)
+                indegree[node.node_id] += 1
+
+        queue = [node_id for node_id, degree in indegree.items() if degree == 0]
+        visited = 0
+        while queue:
+            current = queue.pop(0)
+            visited += 1
+            for child in adjacency.get(current, ()):
+                indegree[child] -= 1
+                if indegree[child] == 0:
+                    queue.append(child)
+        if visited != len(self.nodes):
+            raise ValueError("Dependency graph contains a cycle.")
+
+    def all_new_files(self) -> list[str]:
+        return self._collect_unique_file_paths(lambda node: node.new_files)
+
+    def all_modified_files(self) -> list[str]:
+        return self._collect_unique_file_paths(lambda node: node.modified_files)
+
+    def all_steps(self) -> list[str]:
+        steps: list[str] = []
+        seen: set[str] = set()
+        for node in self.nodes:
+            for step in node.steps:
+                cleaned = step.strip()
+                if cleaned and cleaned not in seen:
+                    seen.add(cleaned)
+                    steps.append(cleaned)
+        return steps
+
+    def _collect_unique_file_paths(
+        self,
+        extractor: Any,
+    ) -> list[str]:
+        collected: list[str] = []
+        seen: set[str] = set()
+        for node in self.nodes:
+            for raw_path in extractor(node):
+                cleaned = raw_path.strip()
+                if not cleaned or cleaned in seen:
+                    continue
+                seen.add(cleaned)
+                collected.append(cleaned)
+        return collected
+
+
+@dataclass(frozen=True)
+class NodeExecutionRecord:
+    node_id: str
+    trace_id: str
+    status: NodeStatus
+    level1_passed: bool
+    duration_seconds: float
+    note: str = ""
+    commands_run: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class OrchestrationTelemetry:
+    total_node_seconds: float = 0.0
+    wall_clock_seconds: float = 0.0
+    parallel_gain: float = 1.0
+    initial_concurrency: int = 1
+    final_concurrency: int = 1
+    adaptive_throttle_events: int = 0
+    level1_pass_nodes: int = 0
+    level1_failed_nodes: int = 0
+    level2_failures: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "total_node_seconds": self.total_node_seconds,
+            "wall_clock_seconds": self.wall_clock_seconds,
+            "parallel_gain": self.parallel_gain,
+            "initial_concurrency": self.initial_concurrency,
+            "final_concurrency": self.final_concurrency,
+            "adaptive_throttle_events": self.adaptive_throttle_events,
+            "level1_pass_nodes": self.level1_pass_nodes,
+            "level1_failed_nodes": self.level1_failed_nodes,
+            "level2_failures": self.level2_failures,
+        }
 
 
 @dataclass(frozen=True)
@@ -148,6 +411,8 @@ class SessionReport:
     initial_result: CommandResult
     final_result: CommandResult
     attempts: list[AttemptRecord] = field(default_factory=list)
+    node_records: list[NodeExecutionRecord] = field(default_factory=list)
+    telemetry: OrchestrationTelemetry | None = None
     success: bool = False
     blocked_reason: str | None = None
 
@@ -157,6 +422,8 @@ class SessionReport:
             "initial_result": self._command_result_to_dict(self.initial_result),
             "final_result": self._command_result_to_dict(self.final_result),
             "attempts": [self._attempt_record_to_dict(attempt) for attempt in self.attempts],
+            "node_records": [self._node_record_to_dict(record) for record in self.node_records],
+            "telemetry": None if self.telemetry is None else self.telemetry.to_dict(),
             "success": self.success,
             "blocked_reason": self.blocked_reason,
         }
@@ -178,6 +445,8 @@ class SessionReport:
             initial_result=cls._command_result_from_dict(payload.get("initial_result")),
             final_result=cls._command_result_from_dict(payload.get("final_result")),
             attempts=attempts,
+            node_records=cls._node_records_from_payload(payload.get("node_records")),
+            telemetry=cls._telemetry_from_payload(payload.get("telemetry")),
             success=bool(payload.get("success", False)),
             blocked_reason=(
                 None
@@ -258,3 +527,63 @@ class SessionReport:
             except ValueError:
                 return FailureType.UNKNOWN
         return FailureType.UNKNOWN
+
+    @staticmethod
+    def _node_record_to_dict(record: NodeExecutionRecord) -> dict[str, Any]:
+        return {
+            "node_id": record.node_id,
+            "trace_id": record.trace_id,
+            "status": record.status.value,
+            "level1_passed": record.level1_passed,
+            "duration_seconds": record.duration_seconds,
+            "note": record.note,
+            "commands_run": list(record.commands_run),
+        }
+
+    @classmethod
+    def _node_records_from_payload(cls, payload: Any) -> list[NodeExecutionRecord]:
+        if not isinstance(payload, list):
+            return []
+        records: list[NodeExecutionRecord] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            status_value = item.get("status")
+            status = NodeStatus.PENDING
+            if isinstance(status_value, str):
+                try:
+                    status = NodeStatus(status_value)
+                except ValueError:
+                    status = NodeStatus.PENDING
+            records.append(
+                NodeExecutionRecord(
+                    node_id=str(item.get("node_id", "")),
+                    trace_id=str(item.get("trace_id", "")),
+                    status=status,
+                    level1_passed=bool(item.get("level1_passed", False)),
+                    duration_seconds=float(item.get("duration_seconds", 0.0)),
+                    note=str(item.get("note", "")),
+                    commands_run=tuple(
+                        command
+                        for command in item.get("commands_run", [])
+                        if isinstance(command, str) and command.strip()
+                    ),
+                )
+            )
+        return records
+
+    @classmethod
+    def _telemetry_from_payload(cls, payload: Any) -> OrchestrationTelemetry | None:
+        if not isinstance(payload, dict):
+            return None
+        return OrchestrationTelemetry(
+            total_node_seconds=float(payload.get("total_node_seconds", 0.0)),
+            wall_clock_seconds=float(payload.get("wall_clock_seconds", 0.0)),
+            parallel_gain=float(payload.get("parallel_gain", 1.0)),
+            initial_concurrency=int(payload.get("initial_concurrency", 1)),
+            final_concurrency=int(payload.get("final_concurrency", 1)),
+            adaptive_throttle_events=int(payload.get("adaptive_throttle_events", 0)),
+            level1_pass_nodes=int(payload.get("level1_pass_nodes", 0)),
+            level1_failed_nodes=int(payload.get("level1_failed_nodes", 0)),
+            level2_failures=int(payload.get("level2_failures", 0)),
+        )

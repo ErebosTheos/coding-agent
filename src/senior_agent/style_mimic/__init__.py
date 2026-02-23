@@ -6,6 +6,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Final
 
 from senior_agent.utils import is_within_workspace
 
@@ -39,6 +40,7 @@ _EXCLUDED_DIR_NAMES = {
 }
 _MAX_SCAN_FILES = 1000
 _MAX_STYLE_SAMPLES = 5
+_MAX_ARCHITECTURE_SIGNALS: Final[int] = 4
 
 
 @dataclass
@@ -75,10 +77,16 @@ class StyleMimic:
         naming = self._infer_naming(snippets)
         quotes = self._infer_quote_style(snippets)
         framework = self._detect_framework(workspace_root, sampled, snippets)
+        architecture = self._infer_architecture_patterns(
+            workspace_root=workspace_root,
+            snippets=snippets,
+        )
 
+        architecture_summary = ", ".join(architecture) if architecture else "general layering"
         return (
             f"Style: {indentation}, {naming} names, {quotes} quotes, "
-            f"{framework} patterns."
+            f"{framework} patterns. "
+            f"Architecture: {architecture_summary}."
         )
 
     @staticmethod
@@ -215,6 +223,76 @@ class StyleMimic:
                     return "Vue"
 
         return "general"
+
+    @classmethod
+    def _infer_architecture_patterns(
+        cls,
+        *,
+        workspace_root: Path,
+        snippets: list[str],
+    ) -> list[str]:
+        merged = "\n".join(snippets)
+        lower_merged = merged.lower()
+        patterns: list[str] = []
+
+        def add(label: str) -> None:
+            if label not in patterns:
+                patterns.append(label)
+
+        # Python architecture signals.
+        if (
+            "from pydantic import" in lower_merged
+            or "import pydantic" in lower_merged
+            or re.search(r"class\s+\w+\((?:\w+, )*(?:basemodel|sqlmodel)\)", merged)
+        ):
+            add("Pydantic data models")
+        if "@dataclass" in lower_merged:
+            add("dataclass-oriented domain models")
+        if (
+            "apirouter(" in lower_merged
+            or "depends(" in lower_merged
+            or "from fastapi import" in lower_merged
+            or "fastapi(" in lower_merged
+            or re.search(r"@(?:app|router)\.(get|post|put|patch|delete)\(", lower_merged)
+        ):
+            add("FastAPI router/dependency flow")
+        if (
+            "sqlalchemy" in lower_merged
+            or "from sqlalchemy import" in lower_merged
+            or "declarative_base" in lower_merged
+        ):
+            add("SQLAlchemy ORM layers")
+        if "pytest.fixture" in lower_merged or "@pytest.fixture" in lower_merged:
+            add("fixture-driven test composition")
+
+        # Frontend architecture signals.
+        if (
+            "usestate(" in lower_merged
+            or "useeffect(" in lower_merged
+            or "usememo(" in lower_merged
+            or "usecallback(" in lower_merged
+        ):
+            add("React hooks-first components")
+        if "createcontext(" in lower_merged or "usecontext(" in lower_merged:
+            add("React context state sharing")
+        if "usereducer(" in lower_merged:
+            add("reducer-based state transitions")
+        if (
+            "createslice(" in lower_merged
+            or "@reduxjs/toolkit" in lower_merged
+            or "configurestore(" in lower_merged
+        ):
+            add("Redux toolkit state modules")
+
+        # Repository-level architecture signals.
+        if (workspace_root / "docker-compose.yml").exists() or (workspace_root / "docker-compose.yaml").exists():
+            add("container-orchestrated services")
+        if (workspace_root / "pnpm-workspace.yaml").exists() or (workspace_root / "turbo.json").exists():
+            add("workspace monorepo structure")
+
+        if not patterns:
+            return []
+        return patterns[:_MAX_ARCHITECTURE_SIGNALS]
 
 
 __all__ = ["StyleMimic"]

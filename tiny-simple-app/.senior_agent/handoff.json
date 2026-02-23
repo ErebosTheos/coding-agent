@@ -1,0 +1,530 @@
+{
+  "checksum": "4d01dfe5ec52a6342c0ffe26a0b65971866ae4e4d798d349ff607ad8e8a3f909",
+  "graph": {
+    "feature_name": "Simple Calculator App",
+    "global_validation_commands": [
+      "python3 main.py & sleep 1 && curl -s http://localhost:8080 | grep -i 'calculator' && kill $!"
+    ],
+    "nodes": [
+      {
+        "contract": {
+          "error_taxonomy": {
+            "ContractMismatch": "Implementation deviates from node intent.",
+            "ValidationFailure": "Validation command failed."
+          },
+          "examples": [
+            {
+              "node_id": "contract_api_logic",
+              "steps": [
+                "Define the internal state object structure (currentValue, previousValue, operator).",
+                "Specify the signatures for calculate(a, b, op) function."
+              ],
+              "target_files": []
+            }
+          ],
+          "inputs": [],
+          "invariants": [
+            "Modify only files listed in node new_files/modified_files.",
+            "Preserve dependency expectations from upstream nodes.",
+            "Implementation must follow the declared node steps."
+          ],
+          "node_id": "contract_api_logic",
+          "outputs": [],
+          "public_api": [
+            "No explicit validation command declared."
+          ],
+          "purpose": "Define the interface for the calculation functions and state management in JavaScript."
+        },
+        "contract_node": true,
+        "depends_on": [],
+        "modified_files": [],
+        "new_files": [],
+        "node_id": "contract_api_logic",
+        "shared_resources": [],
+        "steps": [
+          "Define the internal state object structure (currentValue, previousValue, operator).",
+          "Specify the signatures for calculate(a, b, op) function."
+        ],
+        "summary": "Define the interface for the calculation functions and state management in JavaScript.",
+        "title": "Arithmetic Logic Contract",
+        "validation_commands": []
+      },
+      {
+        "contract": {
+          "error_taxonomy": {
+            "ContractMismatch": "Implementation deviates from node intent.",
+            "ValidationFailure": "Validation command failed."
+          },
+          "examples": [
+            {
+              "node_id": "contract_ui_layout",
+              "steps": [
+                "Define IDs for the display element and operation buttons.",
+                "Establish CSS grid layout parameters for the button container."
+              ],
+              "target_files": []
+            }
+          ],
+          "inputs": [],
+          "invariants": [
+            "Modify only files listed in node new_files/modified_files.",
+            "Preserve dependency expectations from upstream nodes.",
+            "Implementation must follow the declared node steps."
+          ],
+          "node_id": "contract_ui_layout",
+          "outputs": [],
+          "public_api": [
+            "No explicit validation command declared."
+          ],
+          "purpose": "Define the HTML element IDs and CSS class naming conventions for the calculator interface."
+        },
+        "contract_node": true,
+        "depends_on": [],
+        "modified_files": [],
+        "new_files": [],
+        "node_id": "contract_ui_layout",
+        "shared_resources": [],
+        "steps": [
+          "Define IDs for the display element and operation buttons.",
+          "Establish CSS grid layout parameters for the button container."
+        ],
+        "summary": "Define the HTML element IDs and CSS class naming conventions for the calculator interface.",
+        "title": "UI Component Contract",
+        "validation_commands": []
+      },
+      {
+        "contract": {
+          "error_taxonomy": {
+            "ContractMismatch": "Implementation deviates from node intent.",
+            "ValidationFailure": "Validation command failed."
+          },
+          "examples": [
+            {
+              "node_id": "server_verification",
+              "steps": [
+                "Verify main.py uses http.server.SimpleHTTPRequestHandler or similar to serve index.html."
+              ],
+              "target_files": [
+                "main.py"
+              ]
+            }
+          ],
+          "inputs": [
+            {
+              "name": "shared_resources",
+              "type": "main.py"
+            }
+          ],
+          "invariants": [
+            "Modify only files listed in node new_files/modified_files.",
+            "Preserve dependency expectations from upstream nodes.",
+            "Implementation must follow the declared node steps."
+          ],
+          "node_id": "server_verification",
+          "outputs": [
+            {
+              "name": "modified_file",
+              "type": "main.py"
+            }
+          ],
+          "public_api": [
+            "Validation command: python3 -m py_compile main.py"
+          ],
+          "purpose": "Ensure the Python server is correctly configured to serve the static files."
+        },
+        "contract_node": false,
+        "depends_on": [],
+        "modified_files": [
+          "main.py"
+        ],
+        "new_files": [],
+        "node_id": "server_verification",
+        "shared_resources": [
+          "main.py"
+        ],
+        "steps": [
+          "Verify main.py uses http.server.SimpleHTTPRequestHandler or similar to serve index.html."
+        ],
+        "summary": "Ensure the Python server is correctly configured to serve the static files.",
+        "title": "Server Verification",
+        "validation_commands": [
+          "python3 -m py_compile main.py"
+        ]
+      },
+      {
+        "contract": {
+          "error_taxonomy": {
+            "ContractMismatch": "Implementation deviates from node intent.",
+            "ValidationFailure": "Validation command failed."
+          },
+          "examples": [
+            {
+              "node_id": "html_scaffold",
+              "steps": [
+                "Create index.html with a main container and a display read-out area.",
+                "Add a grid container for the calculator buttons."
+              ],
+              "target_files": [
+                "index.html"
+              ]
+            }
+          ],
+          "inputs": [
+            {
+              "name": "depends_on",
+              "type": "contract_ui_layout"
+            },
+            {
+              "name": "shared_resources",
+              "type": "index.html"
+            }
+          ],
+          "invariants": [
+            "Modify only files listed in node new_files/modified_files.",
+            "Preserve dependency expectations from upstream nodes.",
+            "Implementation must follow the declared node steps."
+          ],
+          "node_id": "html_scaffold",
+          "outputs": [
+            {
+              "name": "new_file",
+              "type": "index.html"
+            }
+          ],
+          "public_api": [
+            "No explicit validation command declared."
+          ],
+          "purpose": "Build the base HTML document and calculator container."
+        },
+        "contract_node": false,
+        "depends_on": [
+          "contract_ui_layout"
+        ],
+        "modified_files": [],
+        "new_files": [
+          "index.html"
+        ],
+        "node_id": "html_scaffold",
+        "shared_resources": [
+          "index.html"
+        ],
+        "steps": [
+          "Create index.html with a main container and a display read-out area.",
+          "Add a grid container for the calculator buttons."
+        ],
+        "summary": "Build the base HTML document and calculator container.",
+        "title": "HTML Structure",
+        "validation_commands": []
+      },
+      {
+        "contract": {
+          "error_taxonomy": {
+            "ContractMismatch": "Implementation deviates from node intent.",
+            "ValidationFailure": "Validation command failed."
+          },
+          "examples": [
+            {
+              "node_id": "css_styling",
+              "steps": [
+                "Implement responsive CSS grid for the button layout.",
+                "Add hover effects and active states for calculator buttons."
+              ],
+              "target_files": [
+                "index.html"
+              ]
+            }
+          ],
+          "inputs": [
+            {
+              "name": "depends_on",
+              "type": "html_scaffold"
+            },
+            {
+              "name": "shared_resources",
+              "type": "index.html"
+            }
+          ],
+          "invariants": [
+            "Modify only files listed in node new_files/modified_files.",
+            "Preserve dependency expectations from upstream nodes.",
+            "Implementation must follow the declared node steps."
+          ],
+          "node_id": "css_styling",
+          "outputs": [
+            {
+              "name": "modified_file",
+              "type": "index.html"
+            }
+          ],
+          "public_api": [
+            "No explicit validation command declared."
+          ],
+          "purpose": "Apply CSS to create a modern, centered calculator card."
+        },
+        "contract_node": false,
+        "depends_on": [
+          "html_scaffold"
+        ],
+        "modified_files": [
+          "index.html"
+        ],
+        "new_files": [],
+        "node_id": "css_styling",
+        "shared_resources": [
+          "index.html"
+        ],
+        "steps": [
+          "Implement responsive CSS grid for the button layout.",
+          "Add hover effects and active states for calculator buttons."
+        ],
+        "summary": "Apply CSS to create a modern, centered calculator card.",
+        "title": "Visual Styling",
+        "validation_commands": []
+      },
+      {
+        "contract": {
+          "error_taxonomy": {
+            "ContractMismatch": "Implementation deviates from node intent.",
+            "ValidationFailure": "Validation command failed."
+          },
+          "examples": [
+            {
+              "node_id": "js_arithmetic_core",
+              "steps": [
+                "Implement functions for addition, subtraction, multiplication, and division.",
+                "Handle edge cases like division by zero."
+              ],
+              "target_files": [
+                "index.html"
+              ]
+            }
+          ],
+          "inputs": [
+            {
+              "name": "depends_on",
+              "type": "contract_api_logic,html_scaffold"
+            },
+            {
+              "name": "shared_resources",
+              "type": "index.html"
+            }
+          ],
+          "invariants": [
+            "Modify only files listed in node new_files/modified_files.",
+            "Preserve dependency expectations from upstream nodes.",
+            "Implementation must follow the declared node steps."
+          ],
+          "node_id": "js_arithmetic_core",
+          "outputs": [
+            {
+              "name": "modified_file",
+              "type": "index.html"
+            }
+          ],
+          "public_api": [
+            "No explicit validation command declared."
+          ],
+          "purpose": "Implement the core mathematical functions in JavaScript."
+        },
+        "contract_node": false,
+        "depends_on": [
+          "contract_api_logic",
+          "html_scaffold"
+        ],
+        "modified_files": [
+          "index.html"
+        ],
+        "new_files": [],
+        "node_id": "js_arithmetic_core",
+        "shared_resources": [
+          "index.html"
+        ],
+        "steps": [
+          "Implement functions for addition, subtraction, multiplication, and division.",
+          "Handle edge cases like division by zero."
+        ],
+        "summary": "Implement the core mathematical functions in JavaScript.",
+        "title": "Arithmetic Core Logic",
+        "validation_commands": []
+      },
+      {
+        "contract": {
+          "error_taxonomy": {
+            "ContractMismatch": "Implementation deviates from node intent.",
+            "ValidationFailure": "Validation command failed."
+          },
+          "examples": [
+            {
+              "node_id": "js_ui_bindings",
+              "steps": [
+                "Add event listeners to number buttons to update the display.",
+                "Add event listeners to operator buttons to trigger calculations."
+              ],
+              "target_files": [
+                "index.html"
+              ]
+            }
+          ],
+          "inputs": [
+            {
+              "name": "depends_on",
+              "type": "js_arithmetic_core,css_styling"
+            },
+            {
+              "name": "shared_resources",
+              "type": "index.html"
+            }
+          ],
+          "invariants": [
+            "Modify only files listed in node new_files/modified_files.",
+            "Preserve dependency expectations from upstream nodes.",
+            "Implementation must follow the declared node steps."
+          ],
+          "node_id": "js_ui_bindings",
+          "outputs": [
+            {
+              "name": "modified_file",
+              "type": "index.html"
+            }
+          ],
+          "public_api": [
+            "No explicit validation command declared."
+          ],
+          "purpose": "Connect the HTML buttons to the JavaScript logic."
+        },
+        "contract_node": false,
+        "depends_on": [
+          "js_arithmetic_core",
+          "css_styling"
+        ],
+        "modified_files": [
+          "index.html"
+        ],
+        "new_files": [],
+        "node_id": "js_ui_bindings",
+        "shared_resources": [
+          "index.html"
+        ],
+        "steps": [
+          "Add event listeners to number buttons to update the display.",
+          "Add event listeners to operator buttons to trigger calculations."
+        ],
+        "summary": "Connect the HTML buttons to the JavaScript logic.",
+        "title": "UI Event Bindings",
+        "validation_commands": []
+      },
+      {
+        "contract": {
+          "error_taxonomy": {
+            "ContractMismatch": "Implementation deviates from node intent.",
+            "ValidationFailure": "Validation command failed."
+          },
+          "examples": [
+            {
+              "node_id": "readme_documentation",
+              "steps": [
+                "Document the 'python3 main.py' command and the localhost URL."
+              ],
+              "target_files": [
+                "README.md"
+              ]
+            }
+          ],
+          "inputs": [
+            {
+              "name": "depends_on",
+              "type": "server_verification"
+            }
+          ],
+          "invariants": [
+            "Modify only files listed in node new_files/modified_files.",
+            "Preserve dependency expectations from upstream nodes.",
+            "Implementation must follow the declared node steps."
+          ],
+          "node_id": "readme_documentation",
+          "outputs": [
+            {
+              "name": "new_file",
+              "type": "README.md"
+            }
+          ],
+          "public_api": [
+            "Validation command: test -f README.md"
+          ],
+          "purpose": "Provide instructions for running the application."
+        },
+        "contract_node": false,
+        "depends_on": [
+          "server_verification"
+        ],
+        "modified_files": [],
+        "new_files": [
+          "README.md"
+        ],
+        "node_id": "readme_documentation",
+        "shared_resources": [],
+        "steps": [
+          "Document the 'python3 main.py' command and the localhost URL."
+        ],
+        "summary": "Provide instructions for running the application.",
+        "title": "Execution Documentation",
+        "validation_commands": [
+          "test -f README.md"
+        ]
+      },
+      {
+        "contract": {
+          "error_taxonomy": {
+            "ContractMismatch": "Implementation deviates from node intent.",
+            "ValidationFailure": "Validation command failed."
+          },
+          "examples": [
+            {
+              "node_id": "final_verification",
+              "steps": [
+                "Execute the global validation command to ensure the server starts and serves the UI."
+              ],
+              "target_files": []
+            }
+          ],
+          "inputs": [
+            {
+              "name": "depends_on",
+              "type": "js_ui_bindings,readme_documentation"
+            }
+          ],
+          "invariants": [
+            "Modify only files listed in node new_files/modified_files.",
+            "Preserve dependency expectations from upstream nodes.",
+            "Implementation must follow the declared node steps."
+          ],
+          "node_id": "final_verification",
+          "outputs": [],
+          "public_api": [
+            "Validation command: python3 main.py & sleep 1 && curl -s http://localhost:8080 | grep -i 'calculator' && kill $!"
+          ],
+          "purpose": "Verify the full application lifecycle."
+        },
+        "contract_node": false,
+        "depends_on": [
+          "js_ui_bindings",
+          "readme_documentation"
+        ],
+        "modified_files": [],
+        "new_files": [],
+        "node_id": "final_verification",
+        "shared_resources": [],
+        "steps": [
+          "Execute the global validation command to ensure the server starts and serves the UI."
+        ],
+        "summary": "Verify the full application lifecycle.",
+        "title": "Final Integration Test",
+        "validation_commands": [
+          "python3 main.py & sleep 1 && curl -s http://localhost:8080 | grep -i 'calculator' && kill $!"
+        ]
+      }
+    ],
+    "summary": "A modular decomposition of the calculator app implementation."
+  },
+  "timestamp": "2026-02-23T20:28:21Z"
+}

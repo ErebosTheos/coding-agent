@@ -5,14 +5,21 @@ from enum import Enum
 import hashlib
 import json
 import logging
+import pickle
 import random
+import shutil
 import subprocess
 import time
 from pathlib import Path
 from typing import Callable, Sequence
 
 from senior_agent.classifier import classify_failure
-from senior_agent.llm_client import CodexCLIClient, GeminiCLIClient
+from senior_agent.llm_client import (
+    CodexCLIClient,
+    GeminiCLIClient,
+    LocalOffloadClient,
+    MultiCloudRouter,
+)
 from senior_agent.models import (
     AttemptRecord,
     CommandResult,
@@ -29,6 +36,7 @@ Executor = Callable[[str, Path], CommandResult]
 Classifier = Callable[[str, str, str], FailureType]
 logger = logging.getLogger(__name__)
 CHECKPOINT_SCHEMA_VERSION = 1
+_CHECKPOINT_BINARY_MAGIC = b"SENIOR_AGENT_CHECKPOINT_BIN_V1\n"
 
 
 def run_shell_command(command: str, workspace: Path) -> CommandResult:
@@ -62,6 +70,9 @@ class SeniorAgent:
         retry_backoff_base_seconds: float = 0.0,
         retry_backoff_max_seconds: float = 30.0,
         retry_backoff_jitter_seconds: float = 0.0,
+        adaptive_strategy_ordering: bool = False,
+        enable_verification_cache: bool = True,
+        checkpoint_serialization_mode: str = "json",
         sleep_func: Callable[[float], None] = time.sleep,
         random_func: Callable[[], float] = random.random,
     ) -> None:
@@ -89,6 +100,12 @@ class SeniorAgent:
         self.retry_backoff_base_seconds = retry_backoff_base_seconds
         self.retry_backoff_max_seconds = retry_backoff_max_seconds
         self.retry_backoff_jitter_seconds = retry_backoff_jitter_seconds
+        self.adaptive_strategy_ordering = adaptive_strategy_ordering
+        self.enable_verification_cache = enable_verification_cache
+        mode = checkpoint_serialization_mode.strip().lower()
+        if mode not in {"json", "binary", "ab"}:
+            raise ValueError("checkpoint_serialization_mode must be one of: json, binary, ab.")
+        self.checkpoint_serialization_mode = mode
         self.sleep_func = sleep_func
         self.random_func = random_func
 
@@ -129,10 +146,14 @@ class SeniorAgent:
             len(active_validation_commands),
             self.max_attempts,
         )
+        verification_cache: dict[tuple[int, str], CommandResult] = {}
+        verification_epoch = 0
         initial_success, initial_result = self._run_verification(
             command=command,
             workspace=workspace_path,
             validation_commands=active_validation_commands,
+            verification_cache=verification_cache,
+            verification_epoch=verification_epoch,
         )
         if initial_success:
             logger.info("Initial command succeeded; no healing attempts required.")
@@ -164,6 +185,8 @@ class SeniorAgent:
             active_strategies=active_strategies,
             workspace_path=workspace_path,
             active_validation_commands=active_validation_commands,
+            verification_cache=verification_cache,
+            verification_epoch=verification_epoch,
             checkpoint_path=checkpoint_file,
             checkpoint_metadata=checkpoint_metadata,
         )
@@ -219,6 +242,7 @@ class SeniorAgent:
             workspace_path,
             len(persisted_report.attempts),
         )
+        verification_cache: dict[tuple[int, str], CommandResult] = {}
         return self._heal_from_state(
             command=persisted_report.command,
             initial_result=persisted_report.initial_result,
@@ -228,6 +252,8 @@ class SeniorAgent:
             active_strategies=active_strategies,
             workspace_path=workspace_path,
             active_validation_commands=active_validation_commands,
+            verification_cache=verification_cache,
+            verification_epoch=0,
             checkpoint_path=checkpoint_file,
             checkpoint_metadata=checkpoint_metadata,
         )
@@ -243,6 +269,8 @@ class SeniorAgent:
         active_strategies: Sequence[FixStrategy],
         workspace_path: Path,
         active_validation_commands: Sequence[str],
+        verification_cache: dict[tuple[int, str], CommandResult],
+        verification_epoch: int,
         checkpoint_path: Path | None,
         checkpoint_metadata: dict[str, str | int],
     ) -> SessionReport:
@@ -277,13 +305,21 @@ class SeniorAgent:
             )
 
         for attempt_number in range(start_attempt_number, max_attempts + 1):
-            strategy_index = min(attempt_number - 1, len(active_strategies) - 1)
-            strategy = active_strategies[strategy_index]
             failure_type = self.classifier(
                 final_result.command,
                 final_result.stdout,
                 final_result.stderr,
             )
+            ordered_strategies = (
+                self._order_strategies_for_failure(
+                    strategies=active_strategies,
+                    failure_type=failure_type,
+                )
+                if self.adaptive_strategy_ordering
+                else tuple(active_strategies)
+            )
+            strategy_index = min(attempt_number - 1, len(ordered_strategies) - 1)
+            strategy = ordered_strategies[strategy_index]
             context = FailureContext(
                 command_result=final_result,
                 failure_type=failure_type,
@@ -428,10 +464,13 @@ class SeniorAgent:
                 )
                 continue
 
+            verification_epoch += 1
             verification_success, verification_result = self._run_verification(
                 command=command,
                 workspace=workspace_path,
                 validation_commands=active_validation_commands,
+                verification_cache=verification_cache,
+                verification_epoch=verification_epoch,
             )
             final_result = verification_result
             if verification_success:
@@ -504,10 +543,13 @@ class SeniorAgent:
                     checkpoint_metadata=checkpoint_metadata,
                 )
 
+            verification_epoch += 1
             post_rollback_success, post_rollback_result = self._run_verification(
                 command=command,
                 workspace=workspace_path,
                 validation_commands=active_validation_commands,
+                verification_cache=verification_cache,
+                verification_epoch=verification_epoch,
             )
             final_result = post_rollback_result
             if post_rollback_success:
@@ -584,7 +626,12 @@ class SeniorAgent:
             success=False,
             blocked_reason=None,
         )
-        self._persist_checkpoint(report, checkpoint_path, checkpoint_metadata)
+        self._persist_checkpoint(
+            report,
+            checkpoint_path,
+            checkpoint_metadata,
+            checkpoint_serialization_mode=self.checkpoint_serialization_mode,
+        )
 
     def _finalize_report(
         self,
@@ -606,11 +653,16 @@ class SeniorAgent:
             success=success,
             blocked_reason=blocked_reason,
         )
-        self._persist_checkpoint(report, checkpoint_path, checkpoint_metadata)
+        self._persist_checkpoint(
+            report,
+            checkpoint_path,
+            checkpoint_metadata,
+            checkpoint_serialization_mode=self.checkpoint_serialization_mode,
+        )
         return report
 
-    @staticmethod
     def _build_checkpoint_metadata(
+        self,
         workspace: Path,
         strategies: Sequence[FixStrategy],
         validation_commands: Sequence[str],
@@ -622,6 +674,7 @@ class SeniorAgent:
             "validation_fingerprint": SeniorAgent._build_validation_fingerprint(
                 validation_commands
             ),
+            "checkpoint_format": self.checkpoint_serialization_mode,
         }
 
     @staticmethod
@@ -769,6 +822,17 @@ class SeniorAgent:
                 "Checkpoint validation fingerprint mismatch: checkpoint validation "
                 "commands do not match the current resume configuration."
             )
+        expected_format = expected_metadata.get("checkpoint_format")
+        actual_format = metadata.get("checkpoint_format")
+        if (
+            expected_format is not None
+            and actual_format is not None
+            and expected_format != actual_format
+        ):
+            raise ValueError(
+                "Checkpoint serialization mode mismatch: "
+                f"expected={expected_format} actual={actual_format}"
+            )
 
     @staticmethod
     def _resolve_checkpoint_path(
@@ -798,7 +862,26 @@ class SeniorAgent:
     def _load_checkpoint(
         checkpoint_path: Path,
     ) -> tuple[SessionReport, dict[str, object] | None]:
-        raw_json = checkpoint_path.read_text(encoding="utf-8")
+        raw_bytes = checkpoint_path.read_bytes()
+        if raw_bytes.startswith(_CHECKPOINT_BINARY_MAGIC):
+            binary_payload = raw_bytes[len(_CHECKPOINT_BINARY_MAGIC) :]
+            payload = pickle.loads(binary_payload)
+            if not isinstance(payload, dict):
+                raise ValueError("Binary checkpoint payload must be a mapping.")
+            report_payload = payload.get("report")
+            if not isinstance(report_payload, dict):
+                raise ValueError("Binary checkpoint report payload must be a JSON object.")
+            report = SessionReport.from_dict(report_payload)
+            metadata = {
+                "schema_version": payload.get("schema_version"),
+                "workspace": payload.get("workspace"),
+                "strategy_fingerprint": payload.get("strategy_fingerprint"),
+                "validation_fingerprint": payload.get("validation_fingerprint"),
+                "checkpoint_format": payload.get("checkpoint_format"),
+            }
+            return report, metadata
+
+        raw_json = raw_bytes.decode("utf-8")
         payload = json.loads(raw_json)
         if isinstance(payload, dict) and "report" in payload:
             report_payload = payload.get("report")
@@ -810,6 +893,7 @@ class SeniorAgent:
                 "workspace": payload.get("workspace"),
                 "strategy_fingerprint": payload.get("strategy_fingerprint"),
                 "validation_fingerprint": payload.get("validation_fingerprint"),
+                "checkpoint_format": payload.get("checkpoint_format"),
             }
             return report, metadata
         return SessionReport.from_json(raw_json), None
@@ -819,6 +903,7 @@ class SeniorAgent:
         report: SessionReport,
         checkpoint_path: Path | None,
         checkpoint_metadata: dict[str, str | int],
+        checkpoint_serialization_mode: str = "json",
     ) -> None:
         if checkpoint_path is None:
             return
@@ -827,15 +912,33 @@ class SeniorAgent:
             "workspace": checkpoint_metadata["workspace"],
             "strategy_fingerprint": checkpoint_metadata["strategy_fingerprint"],
             "validation_fingerprint": checkpoint_metadata["validation_fingerprint"],
+            "checkpoint_format": checkpoint_metadata.get("checkpoint_format", checkpoint_serialization_mode),
             "report": report.to_dict(),
         }
+        mode = checkpoint_serialization_mode.strip().lower()
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = checkpoint_path.parent / f".{checkpoint_path.name}.tmp"
-        temp_path.write_text(
-            json.dumps(payload, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        temp_path.replace(checkpoint_path)
+
+        if mode in {"json", "ab"}:
+            temp_path = checkpoint_path.parent / f".{checkpoint_path.name}.tmp"
+            temp_path.write_text(
+                json.dumps(payload, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            temp_path.replace(checkpoint_path)
+
+        if mode in {"binary", "ab"}:
+            binary_target = (
+                checkpoint_path
+                if mode == "binary"
+                else checkpoint_path.with_suffix(f"{checkpoint_path.suffix}.bin")
+            )
+            binary_temp = binary_target.parent / f".{binary_target.name}.tmp"
+            binary_data = _CHECKPOINT_BINARY_MAGIC + pickle.dumps(
+                payload,
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
+            binary_temp.write_bytes(binary_data)
+            binary_temp.replace(binary_target)
 
     def _validate_rollback_contract(
         self,
@@ -918,6 +1021,8 @@ class SeniorAgent:
         command: str,
         workspace: Path,
         validation_commands: Sequence[str],
+        verification_cache: dict[tuple[int, str], CommandResult],
+        verification_epoch: int,
     ) -> tuple[bool, CommandResult]:
         primary_result = self.executor(command, workspace)
         if primary_result.return_code != 0:
@@ -925,6 +1030,17 @@ class SeniorAgent:
 
         last_result = primary_result
         for validation_command in validation_commands:
+            cache_key = (verification_epoch, validation_command)
+            if self.enable_verification_cache:
+                cached_result = verification_cache.get(cache_key)
+                if cached_result is not None:
+                    logger.info(
+                        "Using cached validation result: command=%s epoch=%s",
+                        validation_command,
+                        verification_epoch,
+                    )
+                    last_result = cached_result
+                    continue
             logger.info(
                 "Running validation command: %s (cwd=%s)",
                 validation_command,
@@ -934,7 +1050,29 @@ class SeniorAgent:
             last_result = validation_result
             if validation_result.return_code != 0:
                 return False, validation_result
+            if self.enable_verification_cache:
+                verification_cache[cache_key] = validation_result
         return True, last_result
+
+    @staticmethod
+    def _order_strategies_for_failure(
+        *,
+        strategies: Sequence[FixStrategy],
+        failure_type: FailureType,
+    ) -> tuple[FixStrategy, ...]:
+        matching: list[FixStrategy] = []
+        neutral: list[FixStrategy] = []
+        non_matching: list[FixStrategy] = []
+        for strategy in strategies:
+            allowed_failures = getattr(strategy, "allowed_failures", None)
+            if allowed_failures is None:
+                neutral.append(strategy)
+                continue
+            if failure_type in allowed_failures:
+                matching.append(strategy)
+                continue
+            non_matching.append(strategy)
+        return tuple(matching + neutral + non_matching)
 
     def _sleep_before_next_attempt(self, *, attempt_number: int, max_attempts: int) -> None:
         """Throttle consecutive retries with optional exponential backoff and jitter."""
@@ -974,26 +1112,61 @@ def create_default_senior_agent(
     retry_backoff_base_seconds: float = 0.0,
     retry_backoff_max_seconds: float = 30.0,
     retry_backoff_jitter_seconds: float = 0.0,
+    adaptive_strategy_ordering: bool = True,
+    enable_verification_cache: bool = True,
+    enable_tiered_routing: bool = True,
+    enable_local_offload: bool = True,
+    local_model: str = "deepseek-coder:latest",
+    enable_speculative_racing: bool = True,
+    session_budget_usd: float = 2.0,
+    estimated_cloud_request_cost_usd: float = 0.02,
 ) -> SeniorAgent:
     workspace_path = Path(workspace).resolve()
     provider_normalized = provider.lower()
 
+    codex_client = CodexCLIClient(
+        api_key=api_key,
+        model=model if provider_normalized == "codex" else None,
+        workspace=workspace_path,
+        timeout_seconds=timeout_seconds,
+    )
+    gemini_client = GeminiCLIClient(
+        api_key=api_key,
+        model=model if provider_normalized == "gemini" else None,
+        workspace=workspace_path,
+        timeout_seconds=timeout_seconds,
+    )
+
     if provider_normalized == "codex":
-        llm_client = CodexCLIClient(
-            api_key=api_key,
-            model=model,
-            workspace=workspace_path,
-            timeout_seconds=timeout_seconds,
-        )
+        primary_client = codex_client
+        secondary_client = gemini_client
     elif provider_normalized == "gemini":
-        llm_client = GeminiCLIClient(
-            api_key=api_key,
-            model=model,
-            workspace=workspace_path,
-            timeout_seconds=timeout_seconds,
-        )
+        primary_client = gemini_client
+        secondary_client = codex_client
+    elif provider_normalized in {"dual", "auto"}:
+        primary_client = codex_client
+        secondary_client = gemini_client
     else:
         raise ValueError(f"Unsupported provider: {provider}")
+
+    llm_client = primary_client
+    if enable_tiered_routing:
+        local_client = (
+            LocalOffloadClient(
+                model=local_model,
+                workspace=workspace_path,
+                timeout_seconds=min(timeout_seconds, 60),
+            )
+            if enable_local_offload and shutil.which("ollama") is not None
+            else None
+        )
+        llm_client = MultiCloudRouter(
+            cloud_clients=(primary_client, secondary_client),
+            local_client=local_client,
+            enable_speculative_racing=enable_speculative_racing,
+            session_budget_usd=session_budget_usd,
+            estimated_cloud_request_cost_usd=estimated_cloud_request_cost_usd,
+        )
 
     default_llm_strategy = LLMStrategy(
         llm_client=llm_client,
@@ -1008,4 +1181,6 @@ def create_default_senior_agent(
         retry_backoff_base_seconds=retry_backoff_base_seconds,
         retry_backoff_max_seconds=retry_backoff_max_seconds,
         retry_backoff_jitter_seconds=retry_backoff_jitter_seconds,
+        adaptive_strategy_ordering=adaptive_strategy_ordering,
+        enable_verification_cache=enable_verification_cache,
     )

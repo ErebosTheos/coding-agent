@@ -44,6 +44,20 @@ class DelayedLLMClient:
         return self.response
 
 
+class StreamingLLMClient:
+    def __init__(self, chunks: list[str]) -> None:
+        self.chunks = chunks
+        self.calls = 0
+
+    def generate_fix(self, prompt: str) -> str:
+        raise AssertionError("streaming test should use stream_fix instead of generate_fix")
+
+    def stream_fix(self, prompt: str):
+        self.calls += 1
+        for chunk in self.chunks:
+            yield chunk
+
+
 class LLMStrategyTests(unittest.TestCase):
     def test_overwrites_detected_file_with_llm_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -76,6 +90,7 @@ class LLMStrategyTests(unittest.TestCase):
             self.assertEqual(len(llm_client.prompts), 1)
             self.assertTrue(outcome.diff_summary)
             self.assertIn("pkg/main.py", outcome.diff_summary[0])
+            self.assertTrue(any("Byte delta" in entry for entry in outcome.diff_summary))
 
     def test_extracts_code_from_markdown_fence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -205,6 +220,87 @@ class LLMStrategyTests(unittest.TestCase):
             self.assertEqual(len(slow_failing.prompts), 1)
             self.assertEqual(len(fast_success.prompts), 1)
             self.assertLess(elapsed, 0.3)
+
+    def test_streaming_speculative_parsing_uses_client_stream(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            target_file = workspace / "file.py"
+            target_file.write_text("x = 1\n", encoding="utf-8")
+
+            streaming = StreamingLLMClient(
+                chunks=["```python\n", "x = 2\n", "```\n"],
+            )
+            strategy = LLMStrategy(llm_client=streaming)
+            context = FailureContext(
+                command_result=CommandResult("python file.py", 1, "", "file.py:1: error"),
+                failure_type=FailureType.RUNTIME_EXCEPTION,
+                workspace=workspace,
+                attempt_number=1,
+            )
+
+            outcome = strategy.apply(context)
+
+            self.assertTrue(outcome.applied)
+            self.assertEqual(target_file.read_text(encoding="utf-8"), "x = 2\n")
+            self.assertEqual(streaming.calls, 1)
+
+    def test_response_cache_reuses_identical_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            target_file = workspace / "file.py"
+            target_file.write_text("x = 1\n", encoding="utf-8")
+
+            llm_client = FakeLLMClient(response="x = 2\n")
+            strategy = LLMStrategy(
+                llm_client=llm_client,
+                enable_response_cache=True,
+                response_cache_max_entries=16,
+            )
+            context = FailureContext(
+                command_result=CommandResult(
+                    "python file.py",
+                    1,
+                    "",
+                    "file.py:1: error",
+                ),
+                failure_type=FailureType.RUNTIME_EXCEPTION,
+                workspace=workspace,
+                attempt_number=1,
+            )
+
+            first = strategy.apply(context)
+            target_file.write_text("x = 1\n", encoding="utf-8")
+            second = strategy.apply(context)
+
+            self.assertTrue(first.applied)
+            self.assertTrue(second.applied)
+            self.assertEqual(target_file.read_text(encoding="utf-8"), "x = 2\n")
+            self.assertEqual(len(llm_client.prompts), 1)
+
+    def test_truncates_error_output_in_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            target_file = workspace / "file.py"
+            target_file.write_text("x = 1\n", encoding="utf-8")
+            long_error = ("E" * 2000) + "\nfile.py:1: error"
+
+            llm_client = FakeLLMClient(response="x = 2\n")
+            strategy = LLMStrategy(
+                llm_client=llm_client,
+                max_error_chars=256,
+            )
+            context = FailureContext(
+                command_result=CommandResult("python file.py", 1, "", long_error),
+                failure_type=FailureType.RUNTIME_EXCEPTION,
+                workspace=workspace,
+                attempt_number=1,
+            )
+
+            outcome = strategy.apply(context)
+
+            self.assertTrue(outcome.applied)
+            prompt = llm_client.prompts[0]
+            self.assertIn("[TRUNCATED: error output exceeded 256 characters]", prompt)
 
     def test_includes_top_three_files_in_prompt_context_buffer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -394,6 +490,82 @@ class LLMStrategyTests(unittest.TestCase):
             self.assertIn("Primary Target: sample.py", prompt)
             self.assertIn("Return ONLY the full corrected file content", prompt)
             self.assertIn("--- Code for sample.py ---\nalpha = 1\nbeta = 2\n", prompt)
+
+    def test_includes_symbol_aware_context_with_dependents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            target_file = workspace / "target.py"
+            dependent_file = workspace / "consumer.py"
+            target_file.write_text(
+                "def process(value: int) -> int:\n"
+                "    return value + 1\n",
+                encoding="utf-8",
+            )
+            dependent_file.write_text(
+                "from target import process\n"
+                "VALUE = process(5)\n",
+                encoding="utf-8",
+            )
+
+            llm_client = FakeLLMClient(
+                response=(
+                    "def process(value: int) -> int:\n"
+                    "    return value + 2\n"
+                )
+            )
+            strategy = LLMStrategy(
+                llm_client=llm_client,
+                context_chunk_radius=1,
+                enable_symbol_context=True,
+                max_symbol_targets=2,
+            )
+            context = FailureContext(
+                command_result=CommandResult(
+                    "python -m pytest",
+                    1,
+                    "",
+                    "target.py:2:1: error: AssertionError",
+                ),
+                failure_type=FailureType.TEST_FAILURE,
+                workspace=workspace,
+                attempt_number=1,
+            )
+
+            outcome = strategy.apply(context)
+
+            self.assertTrue(outcome.applied)
+            prompt = llm_client.prompts[0]
+            self.assertIn("Symbol-Aware Context:", prompt)
+            self.assertIn("Target Definition: process", prompt)
+            self.assertIn("Immediate Dependent: consumer.py", prompt)
+            self.assertIn("LSP-Injected Context:", prompt)
+
+    def test_lsp_context_gracefully_falls_back_when_pyright_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            target_file = workspace / "target.py"
+            target_file.write_text("x = 1\n", encoding="utf-8")
+            llm_client = FakeLLMClient(response="x = 2\n")
+            strategy = LLMStrategy(llm_client=llm_client, enable_lsp_context=True)
+            context = FailureContext(
+                command_result=CommandResult(
+                    "python -m pytest",
+                    1,
+                    "",
+                    "target.py:1: error",
+                ),
+                failure_type=FailureType.TEST_FAILURE,
+                workspace=workspace,
+                attempt_number=1,
+            )
+
+            with mock.patch("shutil.which", return_value=None):
+                outcome = strategy.apply(context)
+
+            self.assertTrue(outcome.applied)
+            prompt = llm_client.prompts[0]
+            self.assertIn("LSP-Injected Context:", prompt)
+            self.assertIn("\nNone\n", prompt)
 
     def test_extract_candidate_paths_supports_multiple_languages(self) -> None:
         stderr = (

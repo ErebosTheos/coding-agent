@@ -1,0 +1,44 @@
+{
+  "error_taxonomy": {
+    "ContractMismatch": "Implementation deviates from node intent.",
+    "ValidationFailure": "Validation command failed."
+  },
+  "examples": [
+    {
+      "node_id": "js_ui_bindings",
+      "steps": [
+        "Add event listeners to number buttons to update the display.",
+        "Add event listeners to operator buttons to trigger calculations."
+      ],
+      "target_files": [
+        "index.html"
+      ]
+    }
+  ],
+  "inputs": [
+    {
+      "name": "depends_on",
+      "type": "js_arithmetic_core,css_styling"
+    },
+    {
+      "name": "shared_resources",
+      "type": "index.html"
+    }
+  ],
+  "invariants": [
+    "Modify only files listed in node new_files/modified_files.",
+    "Preserve dependency expectations from upstream nodes.",
+    "Implementation must follow the declared node steps."
+  ],
+  "node_id": "js_ui_bindings",
+  "outputs": [
+    {
+      "name": "modified_file",
+      "type": "index.html"
+    }
+  ],
+  "public_api": [
+    "No explicit validation command declared."
+  ],
+  "purpose": "Connect the HTML buttons to the JavaScript logic."
+}

@@ -8,14 +8,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 _IMPORT_ERROR: Exception | None = None
 try:
     from senior_agent.web_api import (
+        ExecuteRequest,
         ExecutionJob,
+        ProgramExecuteRequest,
         _build_retry_job,
+        _build_developer_router_client,
+        _code_first_phase_review_text,
         _collect_created_files,
         _compute_job_progress,
+        _default_product_spec,
         _tail_file_text,
         _collect_validation_commands,
+        _find_latest_dashboard_path,
+        _find_latest_dashboard_json_path,
+        _extract_orchestrator_failure_details,
         _default_task_plan,
         _derive_phase_requirements_from_plan,
+        _filter_feasible_validation_commands,
+        _resolve_phase_recovery_commands,
         _sanitize_command_list,
         _select_post_heal_commands,
         _split_program_requirement,
@@ -26,6 +36,13 @@ except Exception as exc:  # pragma: no cover - dependency guard
 
 @unittest.skipIf(_IMPORT_ERROR is not None, "web_api dependencies are unavailable.")
 class ProgramRequirementSplitTests(unittest.TestCase):
+    def test_request_models_default_modes(self) -> None:
+        execute = ExecuteRequest(requirement="Build feature")
+        program = ProgramExecuteRequest(requirement="Build program")
+        self.assertFalse(execute.full_capability_mode)
+        self.assertFalse(program.full_capability_mode)
+        self.assertFalse(program.code_first_mode)
+
     def test_returns_single_phase_when_no_numbered_sections(self) -> None:
         requirement = "Build an accessible landing page and add authentication."
         phases = _split_program_requirement(requirement, max_phases=6)
@@ -123,6 +140,80 @@ class ProgramRequirementSplitTests(unittest.TestCase):
         self.assertEqual(validations, ["npm test", "npm run typecheck"])
         self.assertEqual(source, "spec_and_plan_validation_commands")
 
+    def test_filter_feasible_validation_commands_skips_unscaffolded_node_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "tests").mkdir(parents=True, exist_ok=True)
+            commands = [
+                "npm test",
+                "lighthouse https://localhost:3000 --accessibility",
+                "python -m unittest discover -s tests -v",
+            ]
+            feasible = _filter_feasible_validation_commands(
+                commands=commands,
+                workspace=workspace,
+            )
+            self.assertEqual(feasible, [])
+
+    def test_filter_feasible_validation_commands_accepts_unittest_when_tests_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            tests_dir = workspace / "tests"
+            tests_dir.mkdir(parents=True, exist_ok=True)
+            (tests_dir / "test_smoke.py").write_text("def test_smoke():\n    assert True\n", encoding="utf-8")
+            commands = ["python -m unittest discover -s tests -v"]
+            feasible = _filter_feasible_validation_commands(
+                commands=commands,
+                workspace=workspace,
+            )
+            self.assertEqual(feasible, ["python -m unittest discover -s tests -v"])
+
+    def test_resolve_phase_recovery_commands_prefers_phase_specific_feasible_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            package_json = workspace / "package.json"
+            package_json.write_text(
+                '{"name":"demo","scripts":{"test":"echo ok","lint":"echo lint"}}\n',
+                encoding="utf-8",
+            )
+            task_plan = {
+                "tasks": [
+                    {"validation_commands": ["lighthouse https://localhost:3000 --accessibility"]},
+                    {"validation_commands": ["npm test"]},
+                ]
+            }
+            command, validations, source = _resolve_phase_recovery_commands(
+                workspace=workspace,
+                task_plan_payload=task_plan,
+                phase_index=2,
+                fallback_primary_command="npm run lint",
+                fallback_validation_commands=[],
+                fallback_source="spec_and_plan_validation_commands",
+            )
+            self.assertEqual(command, "npm test")
+            self.assertEqual(validations, [])
+            self.assertEqual(source, "phase_2_task_validation_commands")
+
+    def test_resolve_phase_recovery_commands_uses_safe_noop_when_none_are_feasible(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            task_plan = {
+                "tasks": [
+                    {"validation_commands": ["lighthouse https://localhost:3000 --accessibility"]},
+                ]
+            }
+            command, validations, source = _resolve_phase_recovery_commands(
+                workspace=workspace,
+                task_plan_payload=task_plan,
+                phase_index=1,
+                fallback_primary_command="pa11y-ci",
+                fallback_validation_commands=["axe-core-cli"],
+                fallback_source="spec_and_plan_validation_commands",
+            )
+            self.assertIn("validation skipped", command)
+            self.assertEqual(validations, [])
+            self.assertTrue(source.endswith(":safe_noop_fallback"))
+
     def test_collect_created_files_returns_unique_sorted_paths(self) -> None:
         payload = {
             "product_spec_file": "AgentReports/run/01_product_spec.json",
@@ -145,6 +236,87 @@ class ProgramRequirementSplitTests(unittest.TestCase):
         self.assertIn("AgentReports/run/01_product_spec.json", files)
         self.assertIn("AgentReports/run/phases/phase_01_requirement.md", files)
         self.assertIn("AgentReports/run/90_self_heal_report.json", files)
+
+    def test_collect_created_files_includes_posthoc_planning_artifacts(self) -> None:
+        payload = {
+            "posthoc_planning": {
+                "product_spec_file": "AgentReports/run/91_posthoc_product_spec.json",
+                "task_plan_file": "AgentReports/run/92_posthoc_task_plan.json",
+            }
+        }
+        files = _collect_created_files(payload)
+        self.assertIn("AgentReports/run/91_posthoc_product_spec.json", files)
+        self.assertIn("AgentReports/run/92_posthoc_task_plan.json", files)
+
+    def test_default_product_spec_populates_expected_schema(self) -> None:
+        payload = _default_product_spec("Build an accessible donor dashboard.")
+        self.assertIn("product_name", payload)
+        self.assertIn("summary", payload)
+        self.assertEqual(payload.get("validation_commands"), [])
+
+    def test_code_first_phase_review_text_mentions_deferred_review(self) -> None:
+        text = _code_first_phase_review_text(
+            phase_number=1,
+            phase_total=6,
+            phase_success=True,
+        )
+        self.assertIn("code-first mode", text.lower())
+        self.assertIn("deferred", text.lower())
+
+    def test_find_latest_dashboard_path_prefers_new_dashboard_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            baseline_file = workspace / "existing.dashboard.html"
+            baseline_file.write_text("<html>old</html>\n", encoding="utf-8")
+            baseline = {baseline_file.resolve()}
+
+            latest_file = workspace / "new.dashboard.html"
+            latest_file.write_text("<html>new</html>\n", encoding="utf-8")
+
+            resolved = _find_latest_dashboard_path(workspace, baseline)
+            self.assertEqual(resolved, "new.dashboard.html")
+
+    def test_find_latest_dashboard_json_path_prefers_new_dashboard_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            baseline_file = workspace / "existing.dashboard.json"
+            baseline_file.write_text('{"version":1}\n', encoding="utf-8")
+            baseline = {baseline_file.resolve()}
+
+            latest_file = workspace / "new.dashboard.json"
+            latest_file.write_text('{"version":1,"blocked_reason":"x"}\n', encoding="utf-8")
+
+            resolved = _find_latest_dashboard_json_path(workspace, baseline)
+            self.assertEqual(resolved, "new.dashboard.json")
+
+    def test_extract_orchestrator_failure_details_returns_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            dashboard_file = workspace / "feature.dashboard.json"
+            dashboard_file.write_text(
+                (
+                    "{\n"
+                    '  "blocked_reason": "Validation command execution failed.",\n'
+                    '  "final_result": {\n'
+                    '    "command": "npm test",\n'
+                    '    "return_code": 1,\n'
+                    '    "stderr": "npm ERR! missing script"\n'
+                    "  }\n"
+                    "}\n"
+                ),
+                encoding="utf-8",
+            )
+
+            details = _extract_orchestrator_failure_details(
+                workspace=workspace,
+                baseline_dashboard_json=set(),
+            )
+            assert details is not None
+            self.assertEqual(details["dashboard_json_path"], "feature.dashboard.json")
+            self.assertEqual(details["blocked_reason"], "Validation command execution failed.")
+            self.assertEqual(details["final_command"], "npm test")
+            self.assertEqual(details["final_return_code"], 1)
+            self.assertIn("Validation command execution failed", details["summary"])
 
     def test_compute_job_progress_for_running_program_phase(self) -> None:
         job = ExecutionJob(
@@ -174,6 +346,24 @@ class ProgramRequirementSplitTests(unittest.TestCase):
         self.assertEqual(progress["percent"], 100)
         self.assertEqual(progress["active_hook"], "Cancelled")
 
+    def test_compute_job_progress_for_posthoc_planning_stage(self) -> None:
+        job = ExecutionJob(
+            job_id="job-posthoc",
+            job_type="execute_program",
+            workspace=Path(".").resolve(),
+            payload={"max_phases": 4},
+            status="running",
+            result={
+                "stage": "posthoc_planning",
+                "phase_total": 4,
+                "phase_results": [{}, {}],
+            },
+            created_at="2026-02-22T00:00:00+00:00",
+        )
+        progress = _compute_job_progress(job)
+        self.assertEqual(progress["active_hook"], "Post-hoc planning")
+        self.assertEqual(progress["next_hook"], "Post-run self-heal")
+
     def test_build_retry_job_copies_payload(self) -> None:
         previous = ExecutionJob(
             job_id="job-prev",
@@ -196,6 +386,15 @@ class ProgramRequirementSplitTests(unittest.TestCase):
             file_path.write_text("line1\nline2\nline3\nline4\n", encoding="utf-8")
             tail = _tail_file_text(file_path, lines=2)
             self.assertEqual(tail, "line3\nline4")
+
+    def test_build_developer_router_client_returns_llm_protocol(self) -> None:
+        workspace = Path(".").resolve()
+        client = _build_developer_router_client(
+            workspace=workspace,
+            role_provider_map={"architect": "gemini", "developer": "codex"},
+            timeout_config={"codex": 30, "gemini": 30},
+        )
+        self.assertTrue(hasattr(client, "generate_fix"))
 
 
 if __name__ == "__main__":

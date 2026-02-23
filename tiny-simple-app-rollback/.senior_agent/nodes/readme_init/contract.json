@@ -1,0 +1,34 @@
+{
+  "error_taxonomy": {
+    "ContractMismatch": "Implementation deviates from node intent.",
+    "ValidationFailure": "Validation command failed."
+  },
+  "examples": [
+    {
+      "node_id": "readme_init",
+      "steps": [
+        "Create README.md containing 'npx serve .' or 'python3 -m http.server' instructions."
+      ],
+      "target_files": [
+        "README.md"
+      ]
+    }
+  ],
+  "inputs": [],
+  "invariants": [
+    "Modify only files listed in node new_files/modified_files.",
+    "Preserve dependency expectations from upstream nodes.",
+    "Implementation must follow the declared node steps."
+  ],
+  "node_id": "readme_init",
+  "outputs": [
+    {
+      "name": "new_file",
+      "type": "README.md"
+    }
+  ],
+  "public_api": [
+    "Validation command: cat README.md"
+  ],
+  "purpose": "Create the README with instructions to run the application using a local server."
+}

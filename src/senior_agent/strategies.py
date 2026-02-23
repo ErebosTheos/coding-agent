@@ -1,22 +1,50 @@
 from __future__ import annotations
 
+import ast
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import difflib
+import hashlib
+import json
 import logging
+from collections import OrderedDict
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+import shutil
+import subprocess
+import threading
+from uuid import uuid4
 
-from senior_agent.llm_client import LLMClient, LLMClientError
+from senior_agent.llm_client import LLMClient, LLMClientError, parse_streamed_response
 from senior_agent.models import (
     FailureContext,
     FailureType,
     FileRollback,
     FixOutcome,
 )
+from senior_agent.symbol_graph import SymbolGraph
 from senior_agent.utils import is_within_workspace
 
 logger = logging.getLogger(__name__)
+
+_PROMPT_RESPONSE_CACHE: OrderedDict[str, str] = OrderedDict()
+_PROMPT_RESPONSE_CACHE_LOCK = threading.Lock()
+
+
+def _prompt_cache_get(cache_key: str) -> str | None:
+    with _PROMPT_RESPONSE_CACHE_LOCK:
+        cached = _PROMPT_RESPONSE_CACHE.get(cache_key)
+        if cached is not None:
+            _PROMPT_RESPONSE_CACHE.move_to_end(cache_key)
+        return cached
+
+
+def _prompt_cache_set(cache_key: str, response: str, max_entries: int) -> None:
+    with _PROMPT_RESPONSE_CACHE_LOCK:
+        _PROMPT_RESPONSE_CACHE[cache_key] = response
+        _PROMPT_RESPONSE_CACHE.move_to_end(cache_key)
+        while len(_PROMPT_RESPONSE_CACHE) > max_entries:
+            _PROMPT_RESPONSE_CACHE.popitem(last=False)
 
 _SUPPORTED_SOURCE_EXTENSIONS = (
     "py",
@@ -89,6 +117,23 @@ def _build_diff_summary(
                 hunks.append(f"Hunk at {relative_file}: old line {old_line}, new line {new_line}.")
 
     summary: list[str] = [f"Modified {relative_file}: +{added}/-{removed} lines."]
+    before_bytes = before_text.encode("utf-8", errors="ignore")
+    after_bytes = after_text.encode("utf-8", errors="ignore")
+    byte_delta = len(after_bytes) - len(before_bytes)
+    summary.append(
+        f"Byte delta for {relative_file}: {byte_delta:+d} bytes (before={len(before_bytes)}, after={len(after_bytes)})."
+    )
+    first_divergence = None
+    for index, (before_byte, after_byte) in enumerate(zip(before_bytes, after_bytes)):
+        if before_byte != after_byte:
+            first_divergence = index
+            break
+    if first_divergence is None and len(before_bytes) != len(after_bytes):
+        first_divergence = min(len(before_bytes), len(after_bytes))
+    if first_divergence is not None:
+        summary.append(
+            f"First byte divergence at offset {first_divergence} in {relative_file}."
+        )
     summary.extend(hunks[:max_hunks])
     return tuple(summary)
 
@@ -120,6 +165,14 @@ class _ErrorFileReference:
 
 
 @dataclass(frozen=True)
+class _PythonDefinitionSpan:
+    name: str
+    start_line: int
+    end_line: int
+    source: str
+
+
+@dataclass(frozen=True)
 class LLMStrategy:
     """Ask an LLM for a full-file fix using error-driven repository context."""
 
@@ -136,6 +189,19 @@ class LLMStrategy:
     max_control_char_ratio: float = 0.02
     context_chunk_radius: int = 50
     max_chunk_line_multiplier: float = 4.0
+    max_error_chars: int = 12000
+    enable_symbol_context: bool = True
+    max_symbol_targets: int = 3
+    max_symbol_dependents_per_target: int = 2
+    symbol_dependent_snippet_radius: int = 12
+    max_symbol_context_chars: int = 8000
+    enable_lsp_context: bool = True
+    lsp_timeout_seconds: float = 5.0
+    max_lsp_context_chars: int = 4000
+    enable_streaming_speculative_parsing: bool = True
+    enable_response_cache: bool = True
+    response_cache_max_entries: int = 256
+    cache_namespace: str = field(default_factory=lambda: uuid4().hex, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.max_context_files < 1:
@@ -156,6 +222,22 @@ class LLMStrategy:
             raise ValueError("context_chunk_radius must be >= 0.")
         if self.max_chunk_line_multiplier <= 1.0:
             raise ValueError("max_chunk_line_multiplier must be > 1.0.")
+        if self.max_error_chars < 1:
+            raise ValueError("max_error_chars must be >= 1.")
+        if self.max_symbol_targets < 1:
+            raise ValueError("max_symbol_targets must be >= 1.")
+        if self.max_symbol_dependents_per_target < 1:
+            raise ValueError("max_symbol_dependents_per_target must be >= 1.")
+        if self.symbol_dependent_snippet_radius < 0:
+            raise ValueError("symbol_dependent_snippet_radius must be >= 0.")
+        if self.max_symbol_context_chars < 1:
+            raise ValueError("max_symbol_context_chars must be >= 1.")
+        if self.lsp_timeout_seconds <= 0:
+            raise ValueError("lsp_timeout_seconds must be > 0.")
+        if self.max_lsp_context_chars < 1:
+            raise ValueError("max_lsp_context_chars must be >= 1.")
+        if self.response_cache_max_entries < 1:
+            raise ValueError("response_cache_max_entries must be >= 1.")
         if any(client is self.llm_client for client in self.fallback_llm_clients):
             raise ValueError("fallback_llm_clients must not include the primary llm_client.")
 
@@ -227,6 +309,18 @@ class LLMStrategy:
         else:
             prompt_target_code = self._truncate_for_prompt(current_code)
 
+        symbol_context_block = self._build_symbol_context_block(
+            workspace_root=workspace_root,
+            target_file=target_file,
+            target_file_content=current_code,
+            target_line_hint=target_line_hint,
+        )
+        lsp_context_block = self._build_lsp_context_block(
+            workspace_root=workspace_root,
+            target_file=target_file,
+            target_line_hint=target_line_hint,
+        )
+
         prompt = self._build_prompt(
             context=context,
             workspace_root=workspace_root,
@@ -235,6 +329,8 @@ class LLMStrategy:
             additional_context_file_contents=context_file_contents,
             context_line_hints=line_hints,
             chunk_radius=self.context_chunk_radius,
+            symbol_context_block=symbol_context_block,
+            lsp_context_block=lsp_context_block,
         )
         try:
             llm_output = self._generate_fix_with_fallback(prompt)
@@ -515,13 +611,24 @@ class LLMStrategy:
 
     def _read_context_files(self, context_files: list[Path]) -> dict[Path, str]:
         context_map: dict[Path, str] = {}
-        for file_path in context_files:
+        if not context_files:
+            return context_map
+
+        def read_one(file_path: Path) -> tuple[Path, str] | None:
             try:
                 text = file_path.read_text(encoding="utf-8")
             except (UnicodeDecodeError, PermissionError, OSError) as exc:
                 logger.warning("Skipping unreadable context file %s: %s", file_path, exc)
-                continue
-            context_map[file_path] = self._truncate_for_prompt(text)
+                return None
+            return file_path, self._truncate_for_prompt(text)
+
+        max_workers = min(4, len(context_files))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for result in executor.map(read_one, context_files):
+                if result is None:
+                    continue
+                file_path, text = result
+                context_map[file_path] = text
         return context_map
 
     def _truncate_for_prompt(self, file_text: str) -> str:
@@ -533,6 +640,180 @@ class LLMStrategy:
             f"# [TRUNCATED: original file exceeded {self.max_file_chars} characters]"
         )
 
+    def _build_symbol_context_block(
+        self,
+        *,
+        workspace_root: Path,
+        target_file: Path,
+        target_file_content: str,
+        target_line_hint: int | None,
+    ) -> str:
+        if not self.enable_symbol_context:
+            return "None"
+        if target_file.suffix.lower() != ".py":
+            return "None"
+
+        symbol_spans = self._extract_python_definition_spans(target_file_content)
+        if not symbol_spans:
+            return "None"
+        focus_spans = self._select_focus_symbol_spans(
+            symbol_spans=symbol_spans,
+            target_line_hint=target_line_hint,
+            limit=self.max_symbol_targets,
+        )
+        if not focus_spans:
+            return "None"
+
+        graph = SymbolGraph()
+        try:
+            graph.build_graph(workspace_root)
+        except Exception as exc:  # pragma: no cover - defensive guardrail
+            logger.debug("Symbol graph build failed for LLMStrategy prompt context: %s", exc)
+            return "None"
+
+        sections: list[str] = []
+        for span in focus_spans:
+            sections.append(
+                f"Target Definition: {span.name} (lines {span.start_line}-{span.end_line})\n"
+                f"--- Definition Source ({target_file.relative_to(workspace_root)}) ---\n"
+                f"{span.source}"
+            )
+            dependents = graph.get_dependents(target_file, span.name)
+            for dependent in dependents[: self.max_symbol_dependents_per_target]:
+                dependent_snippet = self._read_dependent_symbol_snippet(
+                    workspace_root=workspace_root,
+                    dependent_file=dependent,
+                    symbol_name=span.name,
+                )
+                if dependent_snippet is None:
+                    continue
+                sections.append(
+                    f"Immediate Dependent: {dependent.relative_to(workspace_root)}\n"
+                    f"--- Dependent Snippet ---\n"
+                    f"{dependent_snippet}"
+                )
+
+        if not sections:
+            return "None"
+        block = "\n\n".join(sections)
+        if len(block) > self.max_symbol_context_chars:
+            block = (
+                f"{block[: self.max_symbol_context_chars]}\n\n"
+                f"[TRUNCATED: symbol-aware context exceeded {self.max_symbol_context_chars} characters]"
+            )
+        return block
+
+    @staticmethod
+    def _extract_python_definition_spans(file_text: str) -> list[_PythonDefinitionSpan]:
+        try:
+            tree = ast.parse(file_text)
+        except (SyntaxError, ValueError):
+            return []
+
+        lines = file_text.splitlines(keepends=True)
+        spans: list[_PythonDefinitionSpan] = []
+        seen: set[tuple[str, int, int]] = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            start_line = getattr(node, "lineno", None)
+            end_line = getattr(node, "end_lineno", None)
+            if not isinstance(start_line, int) or not isinstance(end_line, int):
+                continue
+            if start_line < 1 or end_line < start_line:
+                continue
+            key = (node.name, start_line, end_line)
+            if key in seen:
+                continue
+            seen.add(key)
+            source = "".join(lines[start_line - 1 : end_line])
+            spans.append(
+                _PythonDefinitionSpan(
+                    name=node.name,
+                    start_line=start_line,
+                    end_line=end_line,
+                    source=source,
+                )
+            )
+        spans.sort(key=lambda span: (span.start_line, span.end_line))
+        return spans
+
+    @staticmethod
+    def _select_focus_symbol_spans(
+        *,
+        symbol_spans: list[_PythonDefinitionSpan],
+        target_line_hint: int | None,
+        limit: int,
+    ) -> list[_PythonDefinitionSpan]:
+        if not symbol_spans:
+            return []
+
+        if target_line_hint is None:
+            return symbol_spans[:limit]
+
+        matching = [
+            span
+            for span in symbol_spans
+            if span.start_line <= target_line_hint <= span.end_line
+        ]
+        if matching:
+            matching.sort(key=lambda span: ((span.end_line - span.start_line), span.start_line))
+            deduped: list[_PythonDefinitionSpan] = []
+            seen_names: set[str] = set()
+            for span in matching:
+                if span.name in seen_names:
+                    continue
+                seen_names.add(span.name)
+                deduped.append(span)
+                if len(deduped) >= limit:
+                    break
+            if deduped:
+                return deduped
+
+        return symbol_spans[:limit]
+
+    def _read_dependent_symbol_snippet(
+        self,
+        *,
+        workspace_root: Path,
+        dependent_file: Path,
+        symbol_name: str,
+    ) -> str | None:
+        if not is_within_workspace(workspace_root, dependent_file):
+            return None
+        if not dependent_file.exists() or not dependent_file.is_file():
+            return None
+
+        try:
+            dependent_text = dependent_file.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, PermissionError, OSError):
+            return None
+
+        line_hint = self._find_symbol_line_hint(dependent_text, symbol_name)
+        if line_hint is None:
+            return self._truncate_for_prompt(dependent_text)
+
+        start_line, end_line, snippet, total_lines = self._compute_line_window(
+            file_text=dependent_text,
+            line_number=line_hint,
+            radius=self.symbol_dependent_snippet_radius,
+        )
+        return (
+            f"Focused around symbol '{symbol_name}' "
+            f"(line {line_hint}, snippet {start_line}-{end_line} of {total_lines})\n"
+            f"{snippet}"
+        )
+
+    @staticmethod
+    def _find_symbol_line_hint(file_text: str, symbol_name: str) -> int | None:
+        if not symbol_name:
+            return None
+        pattern = re.compile(rf"\b{re.escape(symbol_name)}\b")
+        for index, line in enumerate(file_text.splitlines(), start=1):
+            if pattern.search(line):
+                return index
+        return None
+
     def _build_prompt(
         self,
         context: FailureContext,
@@ -542,6 +823,8 @@ class LLMStrategy:
         additional_context_file_contents: dict[Path, str],
         context_line_hints: dict[Path, int],
         chunk_radius: int,
+        symbol_context_block: str,
+        lsp_context_block: str,
     ) -> str:
         relative_file = target_file.relative_to(workspace_root)
         target_line_hint = context_line_hints.get(target_file)
@@ -591,13 +874,23 @@ class LLMStrategy:
         additional_block = "\n".join(additional_sections).strip()
         if not additional_block:
             additional_block = "None"
+        error_output = context.command_result.combined_output
+        if len(error_output) > self.max_error_chars:
+            error_output = (
+                f"{error_output[: self.max_error_chars]}\n\n"
+                f"[TRUNCATED: error output exceeded {self.max_error_chars} characters]"
+            )
 
         return (
             "You are fixing a failing command in a local repository.\n"
             f"{response_instruction}\n"
             "Do not include markdown fences or commentary.\n\n"
             f"Failing command:\n{context.command_result.command}\n\n"
-            f"Full error output:\n{context.command_result.combined_output}\n\n"
+            f"Full error output:\n{error_output}\n\n"
+            "Symbol-Aware Context:\n"
+            f"{symbol_context_block}\n\n"
+            "LSP-Injected Context:\n"
+            f"{lsp_context_block}\n\n"
             f"Primary Target: {relative_file}\n"
             f"{target_context_note}"
             f"--- Code for {relative_file} ---\n"
@@ -605,6 +898,74 @@ class LLMStrategy:
             "Additional Context Files:\n"
             f"{additional_block}"
         )
+
+    def _build_lsp_context_block(
+        self,
+        *,
+        workspace_root: Path,
+        target_file: Path,
+        target_line_hint: int | None,
+    ) -> str:
+        if not self.enable_lsp_context:
+            return "None"
+        if target_file.suffix.lower() not in {".py", ".ts", ".tsx", ".js", ".jsx"}:
+            return "None"
+        pyright_bin = shutil.which("pyright")
+        if pyright_bin is None:
+            return "None"
+        try:
+            completed = subprocess.run(
+                [pyright_bin, str(target_file), "--outputjson"],
+                cwd=str(workspace_root),
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=self.lsp_timeout_seconds,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return "None"
+
+        output = completed.stdout.strip()
+        if not output:
+            return "None"
+        try:
+            payload = json.loads(output)
+        except json.JSONDecodeError:
+            return "None"
+        diagnostics = payload.get("generalDiagnostics")
+        if not isinstance(diagnostics, list):
+            return "None"
+
+        relative_target = target_file.relative_to(workspace_root).as_posix()
+        lines: list[str] = []
+        for diagnostic in diagnostics:
+            if not isinstance(diagnostic, dict):
+                continue
+            file_value = str(diagnostic.get("file", "")).replace("\\", "/")
+            if not file_value.endswith(relative_target):
+                continue
+            start = diagnostic.get("range", {}).get("start", {}) if isinstance(diagnostic.get("range"), dict) else {}
+            line_number = int(start.get("line", 0)) + 1 if isinstance(start, dict) else 0
+            if target_line_hint is not None and line_number:
+                if abs(line_number - target_line_hint) > 50:
+                    continue
+            severity = str(diagnostic.get("severity", "warning")).lower()
+            message = str(diagnostic.get("message", "")).strip()
+            if not message:
+                continue
+            lines.append(f"- {severity} line {line_number}: {message}")
+            if len(lines) >= 8:
+                break
+
+        if not lines:
+            return "None"
+        block = "\n".join(lines)
+        if len(block) > self.max_lsp_context_chars:
+            block = (
+                f"{block[: self.max_lsp_context_chars]}\n"
+                f"[TRUNCATED: LSP context exceeded {self.max_lsp_context_chars} characters]"
+            )
+        return block
 
     @staticmethod
     def _extract_suggested_code(raw_output: str) -> str:
@@ -614,16 +975,26 @@ class LLMStrategy:
         return raw_output
 
     def _generate_fix_with_fallback(self, prompt: str) -> str:
+        prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        cache_key = f"{self.cache_namespace}:{prompt_hash}"
+        if self.enable_response_cache:
+            cached_response = _prompt_cache_get(cache_key)
+            if cached_response is not None:
+                return cached_response
+
         clients: tuple[LLMClient, ...] = (self.llm_client, *self.fallback_llm_clients)
         if len(clients) == 1:
-            return self.llm_client.generate_fix(prompt)
+            response = self._invoke_client(self.llm_client, prompt)
+            if self.enable_response_cache and isinstance(response, str):
+                _prompt_cache_set(cache_key, response, self.response_cache_max_entries)
+            return response
 
         failures: list[Exception] = []
         executor = ThreadPoolExecutor(max_workers=len(clients))
         wait_for_remaining = True
         try:
             futures = {
-                executor.submit(client.generate_fix, prompt): index
+                executor.submit(self._invoke_client, client, prompt): index
                 for index, client in enumerate(clients)
             }
             for future in as_completed(futures):
@@ -638,6 +1009,8 @@ class LLMStrategy:
                         pending.cancel()
                 wait_for_remaining = False
                 executor.shutdown(wait=False, cancel_futures=True)
+                if self.enable_response_cache and isinstance(output, str):
+                    _prompt_cache_set(cache_key, output, self.response_cache_max_entries)
                 return output
         finally:
             if wait_for_remaining:
@@ -661,6 +1034,16 @@ class LLMStrategy:
             ) from first_error
 
         raise LLMClientError("All configured LLM clients failed without detailed error output.")
+
+    def _invoke_client(self, client: LLMClient, prompt: str) -> str:
+        if self.enable_streaming_speculative_parsing:
+            stream_method = getattr(client, "stream_fix", None)
+            if callable(stream_method):
+                stream_output = stream_method(prompt)
+                if isinstance(stream_output, str):
+                    return stream_output.strip()
+                return parse_streamed_response(stream_output)
+        return client.generate_fix(prompt)
 
 
 @dataclass(frozen=True)

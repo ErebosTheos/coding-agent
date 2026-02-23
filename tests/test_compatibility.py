@@ -6,6 +6,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+warnings.filterwarnings(
+    "ignore",
+    message=r"`self_healing_agent` is deprecated; use `senior_agent` instead\.",
+    category=DeprecationWarning,
+)
+
 
 class CompatibilityShimTests(unittest.TestCase):
     def test_senior_top_level_legacy_aliases_resolve(self) -> None:

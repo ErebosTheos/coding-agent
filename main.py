@@ -64,7 +64,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--provider",
-        choices=["gemini", "codex"],
+        choices=["gemini", "codex", "dual", "auto"],
         default="gemini",
         help=(
             "Compatibility flag for non-server flows. In --serve mode, dual-role routing "

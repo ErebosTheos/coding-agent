@@ -1,0 +1,39 @@
+{
+  "error_taxonomy": {
+    "ContractMismatch": "Implementation deviates from node intent.",
+    "ValidationFailure": "Validation command failed."
+  },
+  "examples": [
+    {
+      "node_id": "server_verification",
+      "steps": [
+        "Verify main.py uses http.server.SimpleHTTPRequestHandler or similar to serve index.html."
+      ],
+      "target_files": [
+        "main.py"
+      ]
+    }
+  ],
+  "inputs": [
+    {
+      "name": "shared_resources",
+      "type": "main.py"
+    }
+  ],
+  "invariants": [
+    "Modify only files listed in node new_files/modified_files.",
+    "Preserve dependency expectations from upstream nodes.",
+    "Implementation must follow the declared node steps."
+  ],
+  "node_id": "server_verification",
+  "outputs": [
+    {
+      "name": "modified_file",
+      "type": "main.py"
+    }
+  ],
+  "public_api": [
+    "Validation command: python3 -m py_compile main.py"
+  ],
+  "purpose": "Ensure the Python server is correctly configured to serve the static files."
+}

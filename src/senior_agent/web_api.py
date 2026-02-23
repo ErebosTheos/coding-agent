@@ -9,11 +9,13 @@ import json
 import logging
 import os
 import re
+import shlex
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 import threading
+import time
 from typing import Any
 from uuid import uuid4
 
@@ -23,8 +25,15 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 import uvicorn
 
-from senior_agent.engine import create_default_senior_agent
-from senior_agent.llm_client import CodexCLIClient, GeminiCLIClient, LLMClient, LLMClientError
+from senior_agent.engine import create_default_senior_agent, run_shell_command
+from senior_agent.llm_client import (
+    CodexCLIClient,
+    GeminiCLIClient,
+    LLMClient,
+    LLMClientError,
+    LocalOffloadClient,
+    MultiCloudRouter,
+)
 from senior_agent.orchestrator import MultiAgentOrchestrator
 from senior_agent.patterns import CODE_FENCE_PATTERN
 from senior_agent.planner import FeaturePlanner
@@ -42,8 +51,17 @@ _MAX_STATUS_JOBS = 25
 _MAX_PROGRAM_PHASES = 12
 _DEFAULT_PROGRAM_PHASES = 6
 _DEFAULT_MAX_SUBTASKS_PER_PHASE = 6
+_DEFAULT_CODE_FIRST_MODE = False
+_DEFAULT_FULL_CAPABILITY_MODE = False
 _MAX_SUBTASKS_PER_PHASE = 20
 _MAX_PHASE_REQUIREMENT_CHARS = 12000
+_MAX_PLANNING_REFINEMENT_ATTEMPTS = 3
+_STRICT_DUAL_AGENT_EXECUTION = True
+_DEFAULT_LLM_TIMEOUT_SECONDS = 120
+_MIN_LLM_TIMEOUT_SECONDS = 15
+_MAX_LLM_TIMEOUT_SECONDS = 600
+_HEARTBEAT_INTERVAL_SECONDS = 10.0
+_DEFAULT_GENERATION_CONCURRENCY = 4
 _REPORTS_DIR_NAME = "AgentReports"
 _PROJECTS_DIR_NAME = "Projects"
 _PROJECT_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -83,6 +101,17 @@ class ExecuteRequest(BaseModel):
     requirement: str
     workspace: str | None = None
     codebase_summary: str | None = None
+    codex_timeout_seconds: int = Field(
+        default=_DEFAULT_LLM_TIMEOUT_SECONDS,
+        ge=_MIN_LLM_TIMEOUT_SECONDS,
+        le=_MAX_LLM_TIMEOUT_SECONDS,
+    )
+    gemini_timeout_seconds: int = Field(
+        default=_DEFAULT_LLM_TIMEOUT_SECONDS,
+        ge=_MIN_LLM_TIMEOUT_SECONDS,
+        le=_MAX_LLM_TIMEOUT_SECONDS,
+    )
+    full_capability_mode: bool = _DEFAULT_FULL_CAPABILITY_MODE
 
 
 class ProgramExecuteRequest(BaseModel):
@@ -95,6 +124,19 @@ class ProgramExecuteRequest(BaseModel):
         ge=1,
         le=_MAX_SUBTASKS_PER_PHASE,
     )
+    fast_mode: bool = True
+    code_first_mode: bool = _DEFAULT_CODE_FIRST_MODE
+    full_capability_mode: bool = _DEFAULT_FULL_CAPABILITY_MODE
+    codex_timeout_seconds: int = Field(
+        default=_DEFAULT_LLM_TIMEOUT_SECONDS,
+        ge=_MIN_LLM_TIMEOUT_SECONDS,
+        le=_MAX_LLM_TIMEOUT_SECONDS,
+    )
+    gemini_timeout_seconds: int = Field(
+        default=_DEFAULT_LLM_TIMEOUT_SECONDS,
+        ge=_MIN_LLM_TIMEOUT_SECONDS,
+        le=_MAX_LLM_TIMEOUT_SECONDS,
+    )
 
 
 class OpenProjectRequest(BaseModel):
@@ -106,10 +148,70 @@ class HealRequest(BaseModel):
     workspace: str | None = None
     max_attempts: int = Field(default=3, ge=1, le=20)
     validation_commands: list[str] | None = None
+    timeout_seconds: int = Field(
+        default=_DEFAULT_LLM_TIMEOUT_SECONDS,
+        ge=_MIN_LLM_TIMEOUT_SECONDS,
+        le=_MAX_LLM_TIMEOUT_SECONDS,
+    )
+    adaptive_strategy_ordering: bool = True
+    enable_verification_cache: bool = True
 
 
 class CreateProjectRequest(BaseModel):
     project_name: str
+
+
+def _normalize_timeout_seconds(raw_value: Any) -> int:
+    try:
+        parsed = int(raw_value)
+    except (TypeError, ValueError):
+        return _DEFAULT_LLM_TIMEOUT_SECONDS
+    return max(_MIN_LLM_TIMEOUT_SECONDS, min(parsed, _MAX_LLM_TIMEOUT_SECONDS))
+
+
+def _build_timeout_config_from_payload(payload: dict[str, Any]) -> dict[str, int]:
+    return {
+        "codex": _normalize_timeout_seconds(payload.get("codex_timeout_seconds")),
+        "gemini": _normalize_timeout_seconds(payload.get("gemini_timeout_seconds")),
+    }
+
+
+def _timeout_for_provider(provider: str, timeout_config: dict[str, int]) -> int:
+    normalized = provider.strip().lower()
+    if normalized == "codex":
+        return timeout_config.get("codex", _DEFAULT_LLM_TIMEOUT_SECONDS)
+    if normalized == "gemini":
+        return timeout_config.get("gemini", _DEFAULT_LLM_TIMEOUT_SECONDS)
+    return _DEFAULT_LLM_TIMEOUT_SECONDS
+
+
+def _run_with_heartbeat(
+    *,
+    app: FastAPI,
+    job_id: str,
+    hook_label: str,
+    run_callable: Any,
+    interval_seconds: float = _HEARTBEAT_INTERVAL_SECONDS,
+) -> Any:
+    stop_event = threading.Event()
+    started_at = time.monotonic()
+
+    def heartbeat() -> None:
+        while not stop_event.wait(interval_seconds):
+            elapsed = int(time.monotonic() - started_at)
+            _update_job_result_state(
+                app=app,
+                job_id=job_id,
+                append_hook=f"{hook_label} (still running, {elapsed}s elapsed).",
+            )
+
+    worker = threading.Thread(target=heartbeat, daemon=True)
+    worker.start()
+    try:
+        return run_callable()
+    finally:
+        stop_event.set()
+        worker.join(timeout=0.2)
 
 
 @dataclass
@@ -121,6 +223,7 @@ class ExecutionJob:
     status: str = "queued"
     success: bool | None = None
     mermaid_path: str | None = None
+    dashboard_path: str | None = None
     error: str | None = None
     result: dict[str, Any] | None = None
     created_at: str = ""
@@ -139,6 +242,7 @@ class ExecutionJob:
             "workspace": str(self.workspace),
             "payload": self.payload,
             "mermaid_path": self.mermaid_path,
+            "dashboard_path": self.dashboard_path,
             "error": self.error,
             "result": self.result,
             "progress": _compute_job_progress(self),
@@ -170,6 +274,7 @@ def _collect_created_files(result_payload: dict[str, Any]) -> list[str]:
         "task_plan_file",
         "summary_file",
         "mermaid_path",
+        "dashboard_path",
     ):
         collect(result_payload.get(key))
 
@@ -180,6 +285,7 @@ def _collect_created_files(result_payload: dict[str, Any]) -> list[str]:
                 continue
             for key in (
                 "mermaid_path",
+                "dashboard_path",
                 "requirement_file",
                 "result_file",
                 "review_file",
@@ -196,6 +302,11 @@ def _collect_created_files(result_payload: dict[str, Any]) -> list[str]:
     if isinstance(post_self_heal, dict):
         for key in ("request_file", "report_file", "review_file"):
             collect(post_self_heal.get(key))
+
+    posthoc_planning = result_payload.get("posthoc_planning")
+    if isinstance(posthoc_planning, dict):
+        for key in ("product_spec_file", "task_plan_file"):
+            collect(posthoc_planning.get(key))
 
     return sorted(created)
 
@@ -246,6 +357,10 @@ def _compute_job_progress(job: ExecutionJob) -> dict[str, Any]:
             active_hook = "Post-run self-heal"
             next_hook = "Finalize program summary"
             steps_completed = phase_total
+        elif stage == "posthoc_planning":
+            active_hook = "Post-hoc planning"
+            next_hook = "Post-run self-heal"
+            steps_completed = min(completed_phases, phase_total)
         else:
             phase_current = int(result_payload.get("phase_current") or 0)
             subtask_current = int(result_payload.get("subtask_current") or 0)
@@ -382,13 +497,50 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _build_llm_client(*, provider: str, workspace: Path) -> LLMClient:
+def _build_llm_client(
+    *,
+    provider: str,
+    workspace: Path,
+    timeout_seconds: int = _DEFAULT_LLM_TIMEOUT_SECONDS,
+) -> LLMClient:
     provider_normalized = provider.lower()
     if provider_normalized == "codex":
-        return CodexCLIClient(workspace=workspace)
+        return CodexCLIClient(workspace=workspace, timeout_seconds=timeout_seconds)
     if provider_normalized == "gemini":
-        return GeminiCLIClient(workspace=workspace)
+        return GeminiCLIClient(workspace=workspace, timeout_seconds=timeout_seconds)
     raise ValueError(f"Unsupported provider: {provider}")
+
+
+def _build_developer_router_client(
+    *,
+    workspace: Path,
+    role_provider_map: dict[str, str],
+    timeout_config: dict[str, int],
+) -> LLMClient:
+    developer_provider = role_provider_map.get("developer", "codex")
+    architect_provider = role_provider_map.get("architect", "gemini")
+    primary = _build_llm_client(
+        provider=developer_provider,
+        workspace=workspace,
+        timeout_seconds=_timeout_for_provider(developer_provider, timeout_config),
+    )
+    if _STRICT_DUAL_AGENT_EXECUTION:
+        return primary
+    secondary = _build_llm_client(
+        provider=architect_provider,
+        workspace=workspace,
+        timeout_seconds=_timeout_for_provider(architect_provider, timeout_config),
+    )
+    local_client = (
+        LocalOffloadClient(workspace=workspace)
+        if shutil.which("ollama") is not None
+        else None
+    )
+    return MultiCloudRouter(
+        cloud_clients=(primary, secondary),
+        local_client=local_client,
+        enable_speculative_racing=True,
+    )
 
 
 def _resolve_role_provider_map(preferred_provider: str) -> dict[str, str]:
@@ -428,18 +580,41 @@ def _require_api_key(request: Request, app: FastAPI) -> None:
         )
 
 
-def _build_orchestrator(*, workspace: Path, role_provider_map: dict[str, str]) -> MultiAgentOrchestrator:
+def _build_orchestrator(
+    *,
+    workspace: Path,
+    role_provider_map: dict[str, str],
+    timeout_config: dict[str, int] | None = None,
+    full_capability_mode: bool = _DEFAULT_FULL_CAPABILITY_MODE,
+) -> MultiAgentOrchestrator:
     architect_provider = role_provider_map.get("architect", "gemini")
-    developer_provider = role_provider_map.get("developer", "codex")
+    effective_timeout_config = timeout_config or {
+        "codex": _DEFAULT_LLM_TIMEOUT_SECONDS,
+        "gemini": _DEFAULT_LLM_TIMEOUT_SECONDS,
+    }
 
-    architect_client = _build_llm_client(provider=architect_provider, workspace=workspace)
-    developer_client = _build_llm_client(provider=developer_provider, workspace=workspace)
-    planner = FeaturePlanner(llm_client=architect_client)
+    architect_client = _build_llm_client(
+        provider=architect_provider,
+        workspace=workspace,
+        timeout_seconds=_timeout_for_provider(architect_provider, effective_timeout_config),
+    )
+    developer_client = _build_developer_router_client(
+        workspace=workspace,
+        role_provider_map=role_provider_map,
+        timeout_config=effective_timeout_config,
+    )
+    planner = FeaturePlanner(
+        llm_client=architect_client,
+        enforce_atomic_node_window=not full_capability_mode,
+    )
     return MultiAgentOrchestrator(
         llm_client=developer_client,
         planner=planner,
         architect_llm_client=architect_client,
         reviewer_llm_client=architect_client,
+        generation_concurrency=_DEFAULT_GENERATION_CONCURRENCY,
+        enforce_semantic_merge_gate=not full_capability_mode,
+        disable_runtime_checks=full_capability_mode,
     )
 
 
@@ -613,6 +788,40 @@ def _build_product_spec_prompt(requirement: str) -> str:
     )
 
 
+def _default_product_spec(requirement: str) -> dict[str, Any]:
+    requirement_clean = requirement.strip()
+    preview = (
+        requirement_clean.splitlines()[0][:120]
+        if requirement_clean
+        else "Program Execution"
+    )
+    return {
+        "product_name": preview or "Program Execution",
+        "summary": "Fallback product spec derived from requirement text.",
+        "personas": [],
+        "features": [],
+        "constraints": [],
+        "accessibility_requirements": [],
+        "security_requirements": [],
+        "acceptance_criteria": [],
+        "validation_commands": [],
+    }
+
+
+def _code_first_phase_review_text(*, phase_number: int, phase_total: int, phase_success: bool) -> str:
+    return (
+        "## Outcome\n"
+        f"- Phase {phase_number}/{phase_total} "
+        f"{'completed' if phase_success else 'failed'} in code-first execution mode.\n"
+        "- Synchronous architect review was deferred to prioritize coding throughput.\n\n"
+        "## Risks\n"
+        "- Review depth may be lower than architect-generated commentary.\n"
+        "- Run full validation and manual inspection before release.\n\n"
+        "## Recommended Next Step\n"
+        "- Continue to the next phase if validations pass; run post-hoc planning artifacts at the end.\n"
+    )
+
+
 def _build_task_plan_prompt(product_spec_text: str, max_phases: int) -> str:
     return (
         "Role: Senior Delivery Planner.\n"
@@ -675,6 +884,204 @@ def _build_review_prompt(
         "Phase Requirement:\n"
         f"{phase_requirement}\n"
     )
+
+
+def _build_phase_gatekeeper_prompt(
+    *,
+    phase_number: int,
+    phase_total: int,
+    phase_requirement: str,
+    subtask_results: list[dict[str, Any]],
+    validation_result: dict[str, Any] | None,
+) -> str:
+    validation_section = "No phase-level validation result was recorded."
+    if isinstance(validation_result, dict):
+        validation_stdout = str(validation_result.get("stdout") or "")
+        validation_stderr = str(validation_result.get("stderr") or "")
+        if len(validation_stdout) > 1200:
+            validation_stdout = f"{validation_stdout[:1200]}\n...[truncated]"
+        if len(validation_stderr) > 1200:
+            validation_stderr = f"{validation_stderr[:1200]}\n...[truncated]"
+        validation_section = (
+            f"Command: {validation_result.get('command')}\n"
+            f"Return code: {validation_result.get('return_code')}\n"
+            f"Success: {validation_result.get('success')}\n"
+            f"STDOUT:\n{validation_stdout}\n\n"
+            f"STDERR:\n{validation_stderr}\n"
+        )
+
+    subtask_lines: list[str] = []
+    for item in subtask_results[:40]:
+        index = item.get("subtask_number")
+        success = bool(item.get("success"))
+        duration_seconds = item.get("duration_seconds")
+        preview = str(item.get("requirement_preview") or "").replace("\n", " ").strip()
+        preview = preview[:160]
+        duration_label = f"{duration_seconds}s" if duration_seconds is not None else "n/a"
+        subtask_lines.append(
+            f"- Subtask {index}: {'PASS' if success else 'FAIL'} "
+            f"(duration={duration_label}) :: {preview}"
+        )
+    if not subtask_lines:
+        subtask_lines = ["- No subtask results available."]
+
+    return (
+        "Role: Chief Architect & Senior Reviewer (Gatekeeper).\n"
+        "Task: Decide whether this phase quality is acceptable.\n"
+        "Return ONLY one JSON object with schema:\n"
+        "{\n"
+        '  "status": "pass|fail",\n'
+        '  "summary": "string",\n'
+        '  "findings": ["string"]\n'
+        "}\n\n"
+        f"Phase: {phase_number}/{phase_total}\n\n"
+        "Phase Requirement:\n"
+        f"{phase_requirement}\n\n"
+        "Subtask Outcomes:\n"
+        f"{chr(10).join(subtask_lines)}\n\n"
+        "Phase Validation Result:\n"
+        f"{validation_section}\n"
+    )
+
+
+def _evaluate_gatekeeper_response(raw_response: str) -> dict[str, Any]:
+    payload = _parse_json_object(raw_response)
+    if payload is None:
+        return {
+            "success": False,
+            "status": "fail",
+            "summary": "Gatekeeper response was not valid JSON.",
+            "findings": [],
+        }
+
+    status_raw = str(payload.get("status", "")).strip().lower()
+    summary = str(payload.get("summary", "")).strip() or "No summary provided."
+    findings_raw = payload.get("findings")
+    findings = []
+    if isinstance(findings_raw, list):
+        findings = [
+            str(item).strip()
+            for item in findings_raw
+            if isinstance(item, str) and item.strip()
+        ]
+
+    pass_statuses = {"pass", "approved", "ok", "accept", "accepted"}
+    fail_statuses = {"fail", "failed", "reject", "rejected", "block", "blocked"}
+    if status_raw in pass_statuses:
+        success = True
+        normalized_status = "pass"
+    elif status_raw in fail_statuses:
+        success = False
+        normalized_status = "fail"
+    else:
+        success = False
+        normalized_status = "fail"
+        if not summary or summary == "No summary provided.":
+            summary = f"Gatekeeper returned unknown status: {status_raw or 'missing'}."
+
+    return {
+        "success": success,
+        "status": normalized_status,
+        "summary": summary,
+        "findings": findings,
+    }
+
+
+def _build_planning_critique_prompt(
+    *,
+    requirement: str,
+    product_spec_payload: dict[str, Any],
+    task_plan_payload: dict[str, Any],
+    phase_subtasks: dict[int, dict[str, Any]],
+) -> str:
+    phase_lines: list[str] = []
+    for phase_index in sorted(phase_subtasks):
+        item = phase_subtasks[phase_index]
+        source = str(item.get("subtask_plan_source") or "unknown")
+        subtasks = item.get("subtasks")
+        if isinstance(subtasks, list):
+            subtask_count = len(subtasks)
+            preview = str(subtasks[0]).splitlines()[0][:120] if subtasks else "none"
+        else:
+            subtask_count = 0
+            preview = "none"
+        phase_lines.append(
+            f"- Phase {phase_index}: subtasks={subtask_count}, source={source}, first={preview}"
+        )
+    phase_section = "\n".join(phase_lines) if phase_lines else "- No phase subtasks generated."
+    return (
+        "Role: Lead Developer Planning Critic (Codex).\n"
+        "Task: Audit the architect planning artifacts before execution.\n"
+        "Check for missing scope, non-atomic breakdown, impossible sequencing, and weak validation coverage.\n"
+        "Return ONLY one JSON object with schema:\n"
+        "{\n"
+        '  "status": "pass|fail",\n'
+        '  "summary": "string",\n'
+        '  "findings": ["string"],\n'
+        '  "required_fixes": ["string"]\n'
+        "}\n\n"
+        "Requirement:\n"
+        f"{requirement}\n\n"
+        "Product Spec:\n"
+        f"{json.dumps(product_spec_payload, indent=2, ensure_ascii=True)}\n\n"
+        "Task Plan:\n"
+        f"{json.dumps(task_plan_payload, indent=2, ensure_ascii=True)}\n\n"
+        "Phase Subtask Outline:\n"
+        f"{phase_section}\n"
+    )
+
+
+def _evaluate_planning_critique_response(raw_response: str) -> dict[str, Any]:
+    payload = _parse_json_object(raw_response)
+    if payload is None:
+        return {
+            "success": False,
+            "status": "fail",
+            "summary": "Planning critique response was not valid JSON.",
+            "findings": [],
+            "required_fixes": [],
+        }
+
+    status_raw = str(payload.get("status", "")).strip().lower()
+    summary = str(payload.get("summary", "")).strip() or "No summary provided."
+    findings_raw = payload.get("findings")
+    fixes_raw = payload.get("required_fixes")
+    findings = []
+    required_fixes = []
+    if isinstance(findings_raw, list):
+        findings = [
+            str(item).strip()
+            for item in findings_raw
+            if isinstance(item, str) and item.strip()
+        ]
+    if isinstance(fixes_raw, list):
+        required_fixes = [
+            str(item).strip()
+            for item in fixes_raw
+            if isinstance(item, str) and item.strip()
+        ]
+
+    pass_statuses = {"pass", "approved", "ok", "accept", "accepted"}
+    fail_statuses = {"fail", "failed", "reject", "rejected", "block", "blocked"}
+    if status_raw in pass_statuses:
+        success = True
+        normalized_status = "pass"
+    elif status_raw in fail_statuses:
+        success = False
+        normalized_status = "fail"
+    else:
+        success = False
+        normalized_status = "fail"
+        if not summary or summary == "No summary provided.":
+            summary = f"Planning critic returned unknown status: {status_raw or 'missing'}."
+
+    return {
+        "success": success,
+        "status": normalized_status,
+        "summary": summary,
+        "findings": findings,
+        "required_fixes": required_fixes,
+    }
 
 
 def _default_task_plan(requirement: str, max_phases: int) -> dict[str, Any]:
@@ -930,6 +1337,204 @@ def _select_post_heal_commands(
     return primary, validations, source
 
 
+def _extract_phase_validation_commands(
+    *,
+    task_plan_payload: dict[str, Any],
+    phase_index: int,
+) -> list[str]:
+    tasks_raw = task_plan_payload.get("tasks")
+    if not isinstance(tasks_raw, list):
+        return []
+    task_position = phase_index - 1
+    if task_position < 0 or task_position >= len(tasks_raw):
+        return []
+    task_payload = tasks_raw[task_position]
+    if not isinstance(task_payload, dict):
+        return []
+    raw_commands = task_payload.get("validation_commands")
+    if not isinstance(raw_commands, list):
+        return []
+    return _sanitize_command_list(raw_commands)
+
+
+def _python_executable_candidates() -> tuple[str, ...]:
+    candidates = [sys.executable, "python3", "python"]
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        cleaned = str(candidate).strip()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        normalized.append(cleaned)
+    return tuple(normalized)
+
+
+def _python_executable_for_validation() -> str:
+    for candidate in _python_executable_candidates():
+        if Path(candidate).exists():
+            return candidate
+        if shutil.which(candidate) is not None:
+            return candidate
+    return "python3"
+
+
+def _resolve_path_token(path_token: str, workspace: Path) -> Path:
+    candidate = Path(path_token)
+    if not candidate.is_absolute():
+        candidate = (workspace / candidate).resolve()
+    return candidate
+
+
+def _is_pytest_command_feasible(tokens: list[str], workspace: Path) -> bool:
+    if shutil.which("pytest") is None:
+        return False
+    target_paths = [
+        token
+        for token in tokens[1:]
+        if not token.startswith("-") and not token.startswith("::")
+    ]
+    if not target_paths:
+        return True
+    for token in target_paths:
+        if token.startswith("http://") or token.startswith("https://"):
+            return False
+        resolved = _resolve_path_token(token, workspace)
+        if resolved.exists():
+            return True
+    return False
+
+
+def _is_python_validation_command_feasible(tokens: list[str], workspace: Path) -> bool:
+    if not tokens:
+        return False
+    executable = tokens[0]
+    if Path(executable).exists():
+        python_available = True
+    else:
+        python_available = shutil.which(executable) is not None
+    if not python_available:
+        return False
+    if len(tokens) >= 3 and tokens[1] == "-m":
+        module = tokens[2]
+        if module == "pytest":
+            return _is_pytest_command_feasible(tokens[2:], workspace)
+        if module == "unittest" and "discover" in tokens[3:]:
+            start_dir = "."
+            if "-s" in tokens:
+                start_index = tokens.index("-s") + 1
+                if start_index < len(tokens):
+                    start_dir = tokens[start_index]
+            if start_dir.startswith("-"):
+                start_dir = "."
+            candidate_root = _resolve_path_token(start_dir, workspace)
+            if not candidate_root.exists() or not candidate_root.is_dir():
+                return False
+            if not any(candidate_root.rglob("test*.py")):
+                return False
+    return True
+
+
+def _is_validation_command_feasible(command: str, workspace: Path) -> bool:
+    trimmed = command.strip()
+    if not trimmed:
+        return False
+    lowered = trimmed.lower()
+    if "http://" in lowered or "https://" in lowered:
+        return False
+    if any(tool in lowered for tool in ("pa11y", "lighthouse", "axe-core", "audit-js")):
+        return False
+
+    try:
+        tokens = shlex.split(trimmed)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+
+    executable = tokens[0]
+    if executable in {"npm", "pnpm", "yarn"}:
+        return (
+            (workspace / "package.json").exists()
+            and shutil.which(executable) is not None
+        )
+    if executable == "pytest":
+        return _is_pytest_command_feasible(tokens, workspace)
+    if executable in _python_executable_candidates():
+        return _is_python_validation_command_feasible(tokens, workspace)
+    if executable == "go":
+        return (workspace / "go.mod").exists() and shutil.which("go") is not None
+    if executable == "cargo":
+        return (workspace / "Cargo.toml").exists() and shutil.which("cargo") is not None
+    if executable == "dotnet":
+        has_dotnet_project = any(workspace.glob("*.csproj")) or any(workspace.glob("*.sln"))
+        return has_dotnet_project and shutil.which("dotnet") is not None
+
+    if Path(executable).exists():
+        return True
+    return shutil.which(executable) is not None
+
+
+def _filter_feasible_validation_commands(
+    *,
+    commands: list[str],
+    workspace: Path,
+) -> list[str]:
+    feasible: list[str] = []
+    for command in _sanitize_command_list(commands):
+        if _is_validation_command_feasible(command, workspace):
+            feasible.append(command)
+    return feasible
+
+
+def _safe_noop_validation_command() -> str:
+    python_executable = _python_executable_for_validation()
+    return (
+        f"{shlex.quote(python_executable)} -c "
+        "\"print('validation skipped: no feasible command for current workspace stage')\""
+    )
+
+
+def _resolve_phase_recovery_commands(
+    *,
+    workspace: Path,
+    task_plan_payload: dict[str, Any],
+    phase_index: int,
+    fallback_primary_command: str,
+    fallback_validation_commands: list[str],
+    fallback_source: str,
+) -> tuple[str, list[str], str]:
+    phase_commands = _extract_phase_validation_commands(
+        task_plan_payload=task_plan_payload,
+        phase_index=phase_index,
+    )
+    source = f"phase_{phase_index}_task_validation_commands"
+    if not phase_commands:
+        phase_commands = [fallback_primary_command, *fallback_validation_commands]
+        source = fallback_source
+
+    filtered = _filter_feasible_validation_commands(
+        commands=phase_commands,
+        workspace=workspace,
+    )
+    if filtered:
+        return filtered[0], filtered[1:], source
+
+    autodetected = _filter_feasible_validation_commands(
+        commands=_autodetect_validation_commands(workspace),
+        workspace=workspace,
+    )
+    if autodetected:
+        return (
+            autodetected[0],
+            autodetected[1:],
+            f"{source}:workspace_autodetect_filtered",
+        )
+
+    noop = _safe_noop_validation_command()
+    return noop, [], f"{source}:safe_noop_fallback"
+
+
 def _prepare_report_directory(workspace: Path, job_id: str) -> Path:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     report_dir = (workspace / _REPORTS_DIR_NAME / f"program_{timestamp}_{job_id[:8]}").resolve()
@@ -975,12 +1580,13 @@ def _write_report_json(
 
 
 def _find_latest_mermaid_path(workspace: Path, baseline: set[Path]) -> str | None:
+    workspace_root = workspace.resolve()
     current = {
         candidate.resolve()
-        for candidate in workspace.glob("*.mermaid")
+        for candidate in workspace_root.glob("*.mermaid")
         if candidate.is_file()
     }
-    candidates = [path for path in current if is_within_workspace(workspace, path)]
+    candidates = [path for path in current if is_within_workspace(workspace_root, path)]
     if not candidates:
         return None
 
@@ -990,7 +1596,103 @@ def _find_latest_mermaid_path(workspace: Path, baseline: set[Path]) -> str | Non
         target = max(target_pool, key=lambda path: path.stat().st_mtime)
     except OSError:
         return None
-    return target.relative_to(workspace).as_posix()
+    return target.relative_to(workspace_root).as_posix()
+
+
+def _find_latest_dashboard_path(workspace: Path, baseline: set[Path]) -> str | None:
+    workspace_root = workspace.resolve()
+    current = {
+        candidate.resolve()
+        for candidate in workspace_root.glob("*.dashboard.html")
+        if candidate.is_file()
+    }
+    candidates = [path for path in current if is_within_workspace(workspace_root, path)]
+    if not candidates:
+        return None
+
+    new_paths = [path for path in candidates if path not in baseline]
+    target_pool = new_paths if new_paths else candidates
+    try:
+        target = max(target_pool, key=lambda path: path.stat().st_mtime)
+    except OSError:
+        return None
+    return target.relative_to(workspace_root).as_posix()
+
+
+def _find_latest_dashboard_json_path(workspace: Path, baseline: set[Path]) -> str | None:
+    workspace_root = workspace.resolve()
+    current = {
+        candidate.resolve()
+        for candidate in workspace_root.glob("*.dashboard.json")
+        if candidate.is_file()
+    }
+    candidates = [path for path in current if is_within_workspace(workspace_root, path)]
+    if not candidates:
+        return None
+
+    new_paths = [path for path in candidates if path not in baseline]
+    target_pool = new_paths if new_paths else candidates
+    try:
+        target = max(target_pool, key=lambda path: path.stat().st_mtime)
+    except OSError:
+        return None
+    return target.relative_to(workspace_root).as_posix()
+
+
+def _extract_orchestrator_failure_details(
+    *,
+    workspace: Path,
+    baseline_dashboard_json: set[Path],
+) -> dict[str, Any] | None:
+    latest_dashboard_json = _find_latest_dashboard_json_path(workspace, baseline_dashboard_json)
+    if not latest_dashboard_json:
+        return None
+
+    workspace_root = workspace.resolve()
+    dashboard_path = (workspace_root / latest_dashboard_json).resolve()
+    if not is_within_workspace(workspace_root, dashboard_path):
+        return None
+    if not dashboard_path.exists() or not dashboard_path.is_file():
+        return None
+
+    try:
+        payload = json.loads(dashboard_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {"dashboard_json_path": latest_dashboard_json}
+    if not isinstance(payload, dict):
+        return {"dashboard_json_path": latest_dashboard_json}
+
+    blocked_reason = str(payload.get("blocked_reason") or "").strip()
+    final_result = payload.get("final_result")
+    final_command = ""
+    final_stderr = ""
+    final_return_code: int | None = None
+    if isinstance(final_result, dict):
+        final_command = str(final_result.get("command") or "").strip()
+        final_stderr = str(final_result.get("stderr") or "").strip()
+        raw_return_code = final_result.get("return_code")
+        if isinstance(raw_return_code, int):
+            final_return_code = raw_return_code
+        else:
+            try:
+                final_return_code = int(raw_return_code)
+            except (TypeError, ValueError):
+                final_return_code = None
+
+    summary = blocked_reason or final_stderr
+    if not summary and final_return_code is not None:
+        summary = f"Orchestrator returned non-success status (return_code={final_return_code})."
+    if not summary:
+        summary = "Orchestrator reported failure without detailed reason."
+
+    return {
+        "dashboard_json_path": latest_dashboard_json,
+        "blocked_reason": blocked_reason,
+        "final_command": final_command,
+        "final_stderr": final_stderr,
+        "final_return_code": final_return_code,
+        "summary": summary,
+    }
 
 
 def _prune_jobs(app: FastAPI) -> None:
@@ -1013,6 +1715,7 @@ def _build_job_response(job: ExecutionJob) -> dict[str, Any]:
         "status": job.status,
         "success": job.success,
         "mermaid_path": job.mermaid_path,
+        "dashboard_path": job.dashboard_path,
         "status_url": f"/api/status?job_id={job.job_id}",
         "created_at": job.created_at,
         "queued": job.status in {"queued", "waiting", "running"},
@@ -1427,6 +2130,11 @@ def _execute_feature_job(app: FastAPI, job_id: str) -> None:
             for candidate in job.workspace.glob("*.mermaid")
             if candidate.is_file()
         }
+        baseline_dashboard = {
+            candidate.resolve()
+            for candidate in job.workspace.glob("*.dashboard.html")
+            if candidate.is_file()
+        }
         _update_job_result_state(
             app=app,
             job_id=job_id,
@@ -1435,12 +2143,16 @@ def _execute_feature_job(app: FastAPI, job_id: str) -> None:
         )
         requirement = str(job.payload["requirement"])
         codebase_summary = str(job.payload.get("codebase_summary") or "").strip()
+        full_capability_mode = bool(job.payload.get("full_capability_mode", _DEFAULT_FULL_CAPABILITY_MODE))
+        timeout_config = _build_timeout_config_from_payload(job.payload)
         if not codebase_summary:
             codebase_summary = _build_codebase_summary(job.workspace)
 
         orchestrator = _build_orchestrator(
             workspace=job.workspace,
             role_provider_map=app.state.role_provider_map,
+            timeout_config=timeout_config,
+            full_capability_mode=full_capability_mode,
         )
         with app.state.execution_lock:
             if _is_job_cancel_requested(app, job_id):
@@ -1461,12 +2173,22 @@ def _execute_feature_job(app: FastAPI, job_id: str) -> None:
                     "stage": "feature_execution",
                     "current_task": "Executing feature request",
                 },
-                append_hook="Running feature implementation and validation.",
+                append_hook=(
+                    "Running feature implementation and validation "
+                    f"(full_capability_mode={'on' if full_capability_mode else 'off'}, "
+                    f"codex_timeout={timeout_config['codex']}s, "
+                    f"gemini_timeout={timeout_config['gemini']}s)."
+                ),
             )
-            success = orchestrator.execute_feature_request(
-                requirement=requirement,
-                codebase_summary=codebase_summary,
-                workspace=job.workspace,
+            success = _run_with_heartbeat(
+                app=app,
+                job_id=job_id,
+                hook_label="Feature execution in progress",
+                run_callable=lambda: orchestrator.execute_feature_request(
+                    requirement=requirement,
+                    codebase_summary=codebase_summary,
+                    workspace=job.workspace,
+                ),
             )
 
         if _is_job_cancel_requested(app, job_id):
@@ -1478,11 +2200,13 @@ def _execute_feature_job(app: FastAPI, job_id: str) -> None:
             return
 
         mermaid_path = _find_latest_mermaid_path(job.workspace, baseline_mermaid)
+        dashboard_path = _find_latest_dashboard_path(job.workspace, baseline_dashboard)
         result_payload = {
             "requirement": requirement,
             "success": success,
             "workspace": str(job.workspace),
             "mermaid_path": mermaid_path,
+            "dashboard_path": dashboard_path,
             "role_providers": dict(app.state.role_provider_map),
         }
         _update_job_result_state(
@@ -1506,6 +2230,7 @@ def _execute_feature_job(app: FastAPI, job_id: str) -> None:
             existing.success = success
             existing.status = "succeeded" if success else "failed"
             existing.mermaid_path = mermaid_path
+            existing.dashboard_path = dashboard_path
             existing.result = result_payload
             existing.finished_at = _utc_now_iso()
     except Exception as exc:  # pragma: no cover - defensive guardrail
@@ -1554,15 +2279,33 @@ def _execute_program_job(app: FastAPI, job_id: str) -> None:
     try:
         requirement = str(job.payload["requirement"])
         codebase_summary_override = str(job.payload.get("codebase_summary") or "").strip()
+        fast_mode = bool(job.payload.get("fast_mode", True))
+        requested_code_first_mode = bool(
+            job.payload.get("code_first_mode", _DEFAULT_CODE_FIRST_MODE)
+        )
+        # Enforce planning-first orchestration for dual-agent program mode.
+        code_first_mode = False
+        full_capability_mode = bool(
+            job.payload.get("full_capability_mode", _DEFAULT_FULL_CAPABILITY_MODE)
+        )
+        timeout_config = _build_timeout_config_from_payload(job.payload)
         max_phases = int(job.payload.get("max_phases", _DEFAULT_PROGRAM_PHASES))
         max_subtasks_per_phase = int(
             job.payload.get("max_subtasks_per_phase", _DEFAULT_MAX_SUBTASKS_PER_PHASE)
         )
         max_subtasks_per_phase = max(1, min(max_subtasks_per_phase, _MAX_SUBTASKS_PER_PHASE))
+        architect_subtask_cap = _MAX_SUBTASKS_PER_PHASE
+        developer_provider = app.state.role_provider_map.get("developer", "codex")
         architect_provider = app.state.role_provider_map.get("architect", "gemini")
         architect_client = _build_llm_client(
             provider=architect_provider,
             workspace=job.workspace,
+            timeout_seconds=_timeout_for_provider(architect_provider, timeout_config),
+        )
+        planning_critic_client = _build_llm_client(
+            provider=developer_provider,
+            workspace=job.workspace,
+            timeout_seconds=_timeout_for_provider(developer_provider, timeout_config),
         )
         _update_job_result_state(
             app=app,
@@ -1571,7 +2314,13 @@ def _execute_program_job(app: FastAPI, job_id: str) -> None:
             append_hook=(
                 "Execution slot acquired. "
                 f"Architect provider: {architect_provider}, Developer provider: "
-                f"{app.state.role_provider_map.get('developer', 'codex')}."
+                f"{developer_provider}. "
+                f"Fast mode={'on' if fast_mode else 'off'}, "
+                f"requested_code_first_mode={'on' if requested_code_first_mode else 'off'}, "
+                f"effective_code_first_mode={'on' if code_first_mode else 'off'}, "
+                f"full_capability_mode={'on' if full_capability_mode else 'off'}, "
+                f"codex_timeout={timeout_config['codex']}s, "
+                f"gemini_timeout={timeout_config['gemini']}s."
             ),
         )
 
@@ -1592,6 +2341,19 @@ def _execute_program_job(app: FastAPI, job_id: str) -> None:
                 f"developer={app.state.role_provider_map.get('developer', 'codex')}"
             )
         ]
+        if requested_code_first_mode:
+            planning_notes.append(
+                "Requested code_first_mode was overridden to planning-first mode "
+                "for strict dual-agent orchestration."
+            )
+        planning_notes.append(
+            "Planning-first mode enabled: architect auto-sizes subtask counts "
+            f"(safety cap={architect_subtask_cap}) before coding."
+        )
+        if full_capability_mode:
+            planning_notes.append(
+                "Full capability mode enabled: strict validation and gate checks are bypassed."
+            )
         _update_job_result_state(
             app=app,
             job_id=job_id,
@@ -1620,46 +2382,58 @@ def _execute_program_job(app: FastAPI, job_id: str) -> None:
             relative_name="01_product_spec_prompt.txt",
             content=f"{product_spec_prompt.rstrip()}\n",
         )
-        _update_job_result_state(
-            app=app,
-            job_id=job_id,
-            updates={"current_task": "Generating product spec"},
-            append_hook="Generating product spec with architect model.",
-        )
-        try:
-            if _is_job_cancel_requested(app, job_id):
-                _finalize_job_cancelled(
+        if code_first_mode:
+            _update_job_result_state(
+                app=app,
+                job_id=job_id,
+                updates={"current_task": "Code-first bootstrap planning"},
+                append_hook=(
+                    "Code-first mode: skipping upfront architect product spec generation."
+                ),
+            )
+            product_spec_raw = json.dumps(
+                _default_product_spec(requirement),
+                indent=2,
+                ensure_ascii=True,
+            )
+        else:
+            _update_job_result_state(
+                app=app,
+                job_id=job_id,
+                updates={"current_task": "Generating product spec"},
+                append_hook="Generating product spec with architect model.",
+            )
+            try:
+                if _is_job_cancel_requested(app, job_id):
+                    _finalize_job_cancelled(
+                        app=app,
+                        job_id=job_id,
+                        message="Cancelled before product spec generation.",
+                    )
+                    return
+                product_spec_raw = _run_with_heartbeat(
                     app=app,
                     job_id=job_id,
-                    message="Cancelled before product spec generation.",
+                    hook_label="Architect generating product spec",
+                    run_callable=lambda: architect_client.generate_fix(product_spec_prompt),
                 )
-                return
-            product_spec_raw = architect_client.generate_fix(product_spec_prompt)
-            _update_job_result_state(
-                app=app,
-                job_id=job_id,
-                append_hook="Product spec generated.",
-            )
-        except LLMClientError as exc:
-            planning_notes.append(f"Product spec generation fallback used: {exc}")
-            _update_job_result_state(
-                app=app,
-                job_id=job_id,
-                append_hook=f"Product spec generation failed; using fallback: {exc}",
-            )
-            product_spec_raw = (
-                "{\n"
-                '  "product_name": "Program Execution",\n'
-                '  "summary": "Fallback product spec generated due to LLM error.",\n'
-                '  "personas": [],\n'
-                '  "features": [],\n'
-                '  "constraints": [],\n'
-                '  "accessibility_requirements": [],\n'
-                '  "security_requirements": [],\n'
-                '  "acceptance_criteria": [],\n'
-                '  "validation_commands": []\n'
-                "}\n"
-            )
+                _update_job_result_state(
+                    app=app,
+                    job_id=job_id,
+                    append_hook="Product spec generated.",
+                )
+            except LLMClientError as exc:
+                planning_notes.append(f"Product spec generation fallback used: {exc}")
+                _update_job_result_state(
+                    app=app,
+                    job_id=job_id,
+                    append_hook=f"Product spec generation failed; using fallback: {exc}",
+                )
+                product_spec_raw = json.dumps(
+                    _default_product_spec(requirement),
+                    indent=2,
+                    ensure_ascii=True,
+                )
         product_spec_response_file = _write_report_text(
             workspace=job.workspace,
             report_dir=report_dir,
@@ -1686,34 +2460,50 @@ def _execute_program_job(app: FastAPI, job_id: str) -> None:
             relative_name="02_task_plan_prompt.txt",
             content=f"{task_plan_prompt.rstrip()}\n",
         )
-        _update_job_result_state(
-            app=app,
-            job_id=job_id,
-            updates={"current_task": "Generating task plan"},
-            append_hook="Generating task plan with architect model.",
-        )
-        try:
-            if _is_job_cancel_requested(app, job_id):
-                _finalize_job_cancelled(
-                    app=app,
-                    job_id=job_id,
-                    message="Cancelled before task plan generation.",
-                )
-                return
-            task_plan_raw = architect_client.generate_fix(task_plan_prompt)
+        if code_first_mode:
             _update_job_result_state(
                 app=app,
                 job_id=job_id,
-                append_hook="Task plan generated.",
-            )
-        except LLMClientError as exc:
-            planning_notes.append(f"Task plan generation fallback used: {exc}")
-            _update_job_result_state(
-                app=app,
-                job_id=job_id,
-                append_hook=f"Task plan generation failed; using fallback: {exc}",
+                updates={"current_task": "Code-first task bootstrap"},
+                append_hook=(
+                    "Code-first mode: using deterministic phase split before coding."
+                ),
             )
             task_plan_raw = ""
+        else:
+            _update_job_result_state(
+                app=app,
+                job_id=job_id,
+                updates={"current_task": "Generating task plan"},
+                append_hook="Generating task plan with architect model.",
+            )
+            try:
+                if _is_job_cancel_requested(app, job_id):
+                    _finalize_job_cancelled(
+                        app=app,
+                        job_id=job_id,
+                        message="Cancelled before task plan generation.",
+                    )
+                    return
+                task_plan_raw = _run_with_heartbeat(
+                    app=app,
+                    job_id=job_id,
+                    hook_label="Architect generating task plan",
+                    run_callable=lambda: architect_client.generate_fix(task_plan_prompt),
+                )
+                _update_job_result_state(
+                    app=app,
+                    job_id=job_id,
+                    append_hook="Task plan generated.",
+                )
+            except LLMClientError as exc:
+                planning_notes.append(f"Task plan generation fallback used: {exc}")
+                _update_job_result_state(
+                    app=app,
+                    job_id=job_id,
+                    append_hook=f"Task plan generation failed; using fallback: {exc}",
+                )
+                task_plan_raw = ""
         task_plan_response_file = _write_report_text(
             workspace=job.workspace,
             report_dir=report_dir,
@@ -1744,11 +2534,369 @@ def _execute_program_job(app: FastAPI, job_id: str) -> None:
         )
         if not phases:
             raise ValueError("Program requirement must not be empty.")
+        phase_total = len(phases)
+
+        def _plan_detailed_subtasks_for_phases(
+            *,
+            phases_to_plan: list[str],
+            attempt: int,
+        ) -> tuple[dict[int, dict[str, Any]], bool]:
+            local_phase_total = len(phases_to_plan)
+            planned_subtasks: dict[int, dict[str, Any]] = {}
+            phase_start_label = (
+                "Planning phase started: generating detailed subtask plans "
+                "for all phases before coding."
+                if attempt == 1
+                else (
+                    "Planning refinement pass started: regenerating detailed subtask plans "
+                    f"(attempt {attempt}/{_MAX_PLANNING_REFINEMENT_ATTEMPTS})."
+                )
+            )
+            _update_job_result_state(
+                app=app,
+                job_id=job_id,
+                updates={
+                    "stage": "phase_planning",
+                    "phase_current": 0,
+                    "phase_total": local_phase_total,
+                    "current_task": (
+                        f"Planning detailed subtasks for {local_phase_total} phases"
+                    ),
+                },
+                append_hook=phase_start_label,
+            )
+
+            for phase_index, phase_requirement in enumerate(phases_to_plan, start=1):
+                if _is_job_cancel_requested(app, job_id):
+                    _finalize_job_cancelled(
+                        app=app,
+                        job_id=job_id,
+                        message=f"Cancelled while planning phase {phase_index}.",
+                    )
+                    return {}, True
+                phase_base_name = f"phases/phase_{phase_index:02d}"
+                _update_job_result_state(
+                    app=app,
+                    job_id=job_id,
+                    updates={
+                        "stage": "phase_planning",
+                        "phase_current": phase_index,
+                        "phase_total": local_phase_total,
+                        "current_task": (
+                            f"Generating subtasks for phase {phase_index}/{local_phase_total}"
+                        ),
+                    },
+                    append_hook=(
+                        f"Requesting Gemini subtask breakdown for phase {phase_index}/{local_phase_total} "
+                        f"(auto-size up to {architect_subtask_cap})."
+                    ),
+                )
+                subtasks, subtask_plan_prompt, subtask_plan_response, subtask_plan_source = _run_with_heartbeat(
+                    app=app,
+                    job_id=job_id,
+                    hook_label=(
+                        f"Architect deriving subtasks for phase {phase_index}/{local_phase_total}"
+                    ),
+                    run_callable=lambda phase_requirement=phase_requirement: _derive_subtasks_with_architect(
+                        architect_client=architect_client,
+                        phase_requirement=phase_requirement,
+                        max_subtasks=architect_subtask_cap,
+                    ),
+                )
+                prompt_name = (
+                    f"{phase_base_name}_subtask_plan_prompt.txt"
+                    if attempt == 1
+                    else f"{phase_base_name}_subtask_plan_attempt_{attempt:02d}_prompt.txt"
+                )
+                response_name = (
+                    f"{phase_base_name}_subtask_plan_response.txt"
+                    if attempt == 1
+                    else f"{phase_base_name}_subtask_plan_attempt_{attempt:02d}_response.txt"
+                )
+                subtask_plan_prompt_file = _write_report_text(
+                    workspace=job.workspace,
+                    report_dir=report_dir,
+                    relative_name=prompt_name,
+                    content=f"{subtask_plan_prompt.rstrip()}\n",
+                )
+                subtask_plan_response_file: str | None = None
+                if isinstance(subtask_plan_response, str) and subtask_plan_response.strip():
+                    subtask_plan_response_file = _write_report_text(
+                        workspace=job.workspace,
+                        report_dir=report_dir,
+                        relative_name=response_name,
+                        content=f"{subtask_plan_response.rstrip()}\n",
+                    )
+                if not subtasks:
+                    subtasks = [phase_requirement]
+                    subtask_plan_source = f"{subtask_plan_source}:single_phase_fallback"
+                planned_subtasks[phase_index] = {
+                    "subtasks": list(subtasks),
+                    "subtask_plan_source": subtask_plan_source,
+                    "subtask_plan_prompt_file": subtask_plan_prompt_file,
+                    "subtask_plan_response_file": subtask_plan_response_file,
+                    "planning_attempt": attempt,
+                }
+                _update_job_result_state(
+                    app=app,
+                    job_id=job_id,
+                    append_hook=(
+                        f"Planned phase {phase_index}/{local_phase_total} with {len(subtasks)} subtasks "
+                        f"(source={subtask_plan_source}, attempt={attempt})."
+                    ),
+                )
+            return planned_subtasks, False
+
+        planned_phase_subtasks, planning_cancelled = _plan_detailed_subtasks_for_phases(
+            phases_to_plan=phases,
+            attempt=1,
+        )
+        if planning_cancelled:
+            return
+
+        planning_critique_summary: dict[str, Any] | None = None
+        critique_passed = False
+        for critique_attempt in range(1, _MAX_PLANNING_REFINEMENT_ATTEMPTS + 1):
+            if _is_job_cancel_requested(app, job_id):
+                _finalize_job_cancelled(
+                    app=app,
+                    job_id=job_id,
+                    message=(
+                        "Cancelled during planning critique "
+                        f"(attempt {critique_attempt})."
+                    ),
+                )
+                return
+            critique_prompt = _build_planning_critique_prompt(
+                requirement=requirement,
+                product_spec_payload=product_spec_payload,
+                task_plan_payload=task_plan_payload,
+                phase_subtasks=planned_phase_subtasks,
+            )
+            critique_prompt_file = _write_report_text(
+                workspace=job.workspace,
+                report_dir=report_dir,
+                relative_name=(
+                    f"03_planning_critique_attempt_{critique_attempt:02d}_prompt.txt"
+                ),
+                content=f"{critique_prompt.rstrip()}\n",
+            )
+            _update_job_result_state(
+                app=app,
+                job_id=job_id,
+                updates={
+                    "stage": "planning",
+                    "current_task": (
+                        f"Codex planning critique attempt "
+                        f"{critique_attempt}/{_MAX_PLANNING_REFINEMENT_ATTEMPTS}"
+                    ),
+                },
+                append_hook=(
+                    "Running Codex planning critique "
+                    f"(attempt {critique_attempt}/{_MAX_PLANNING_REFINEMENT_ATTEMPTS})."
+                ),
+            )
+            try:
+                critique_raw = _run_with_heartbeat(
+                    app=app,
+                    job_id=job_id,
+                    hook_label=(
+                        f"Codex critiquing planning attempt "
+                        f"{critique_attempt}/{_MAX_PLANNING_REFINEMENT_ATTEMPTS}"
+                    ),
+                    run_callable=lambda: planning_critic_client.generate_fix(critique_prompt),
+                )
+            except LLMClientError as exc:
+                critique_raw = json.dumps(
+                    {
+                        "status": "fail",
+                        "summary": f"Planning critique LLM error: {exc}",
+                        "findings": [f"Critique generation error: {exc}"],
+                        "required_fixes": [
+                            "Regenerate task plan and retry planning critique.",
+                        ],
+                    },
+                    indent=2,
+                    ensure_ascii=True,
+                )
+            critique_response_file = _write_report_text(
+                workspace=job.workspace,
+                report_dir=report_dir,
+                relative_name=(
+                    f"03_planning_critique_attempt_{critique_attempt:02d}_response.txt"
+                ),
+                content=f"{critique_raw.rstrip()}\n",
+            )
+            critique_eval = _evaluate_planning_critique_response(critique_raw)
+            critique_eval["attempt"] = critique_attempt
+            critique_eval["prompt_file"] = critique_prompt_file
+            critique_eval["response_file"] = critique_response_file
+            planning_critique_summary = critique_eval
+
+            if bool(critique_eval.get("success")):
+                critique_passed = True
+                _update_job_result_state(
+                    app=app,
+                    job_id=job_id,
+                    append_hook=(
+                        "Planning critique passed on attempt "
+                        f"{critique_attempt}/{_MAX_PLANNING_REFINEMENT_ATTEMPTS}."
+                    ),
+                )
+                break
+
+            planning_notes.append(
+                "Planning critique failed "
+                f"(attempt {critique_attempt}): {critique_eval.get('summary', 'no summary')}"
+            )
+            _update_job_result_state(
+                app=app,
+                job_id=job_id,
+                append_hook=(
+                    "Planning critique failed: "
+                    f"{str(critique_eval.get('summary') or 'no summary')[:280]}"
+                ),
+            )
+            if critique_attempt >= _MAX_PLANNING_REFINEMENT_ATTEMPTS:
+                break
+
+            findings = critique_eval.get("required_fixes")
+            if isinstance(findings, list) and findings:
+                critique_findings = [
+                    str(item).strip()
+                    for item in findings
+                    if str(item).strip()
+                ]
+            else:
+                fallback_findings = critique_eval.get("findings")
+                if isinstance(fallback_findings, list) and fallback_findings:
+                    critique_findings = [
+                        str(item).strip()
+                        for item in fallback_findings
+                        if str(item).strip()
+                    ]
+                else:
+                    critique_findings = [
+                        str(critique_eval.get("summary") or "Refine planning artifacts.")
+                    ]
+            critique_feedback = "\n".join(
+                f"- {item}" for item in critique_findings[:20]
+            )
+            refinement_prompt = (
+                "Role: Senior Delivery Planner.\n"
+                "Task: Refine the task plan to address the planning critic findings.\n"
+                "Return ONLY one JSON object with schema:\n"
+                "{\n"
+                '  "feature_name": "string",\n'
+                '  "summary": "string",\n'
+                '  "tasks": [\n'
+                "    {\n"
+                '      "id": "T1",\n'
+                '      "title": "string",\n'
+                '      "requirement": "string",\n'
+                '      "depends_on": ["task id"],\n'
+                '      "validation_commands": ["string"]\n'
+                "    }\n"
+                "  ]\n"
+                "}\n"
+                f"Limit to at most {max_phases} tasks.\n\n"
+                "Product Spec:\n"
+                f"{product_spec_text_for_planning}\n\n"
+                "Current Task Plan:\n"
+                f"{json.dumps(task_plan_payload, indent=2, ensure_ascii=True)}\n\n"
+                "Critique Findings to Address:\n"
+                f"{critique_feedback}\n"
+            )
+            refinement_prompt_file = _write_report_text(
+                workspace=job.workspace,
+                report_dir=report_dir,
+                relative_name=(
+                    f"02_task_plan_refinement_attempt_{critique_attempt + 1:02d}_prompt.txt"
+                ),
+                content=f"{refinement_prompt.rstrip()}\n",
+            )
+            _update_job_result_state(
+                app=app,
+                job_id=job_id,
+                updates={"current_task": "Architect refining task plan from critique"},
+                append_hook=(
+                    "Requesting Gemini task plan refinement "
+                    f"(attempt {critique_attempt + 1}/{_MAX_PLANNING_REFINEMENT_ATTEMPTS})."
+                ),
+            )
+            try:
+                refined_task_plan_raw = _run_with_heartbeat(
+                    app=app,
+                    job_id=job_id,
+                    hook_label=(
+                        f"Architect refining task plan attempt "
+                        f"{critique_attempt + 1}/{_MAX_PLANNING_REFINEMENT_ATTEMPTS}"
+                    ),
+                    run_callable=lambda: architect_client.generate_fix(refinement_prompt),
+                )
+            except LLMClientError as exc:
+                planning_notes.append(
+                    "Task plan refinement fallback used on critique loop: "
+                    f"{exc}"
+                )
+                refined_task_plan_raw = ""
+            refined_task_plan_response_file = _write_report_text(
+                workspace=job.workspace,
+                report_dir=report_dir,
+                relative_name=(
+                    f"02_task_plan_refinement_attempt_{critique_attempt + 1:02d}_response.txt"
+                ),
+                content=f"{refined_task_plan_raw.rstrip()}\n",
+            )
+            task_plan_payload = _parse_json_object(refined_task_plan_raw) or _default_task_plan(
+                requirement,
+                max_phases,
+            )
+            if not refined_task_plan_raw.strip():
+                task_plan_payload["summary"] = (
+                    f"{task_plan_payload.get('summary', '')} "
+                    "Fallback refined plan generated from requirement splitting."
+                ).strip()
+            task_plan_payload["raw_response_file"] = refined_task_plan_response_file
+            task_plan_payload["refinement_prompt_file"] = refinement_prompt_file
+            task_plan_payload["refined_from_critique_attempt"] = critique_attempt
+            task_plan_file = _write_report_json(
+                workspace=job.workspace,
+                report_dir=report_dir,
+                relative_name="02_task_plan.json",
+                payload=task_plan_payload,
+            )
+
+            phases = _derive_phase_requirements_from_plan(
+                task_plan_payload,
+                fallback_requirement=requirement,
+                max_phases=max_phases,
+            )
+            if not phases:
+                raise ValueError(
+                    "Program requirement became empty after planning refinement."
+                )
+            phase_total = len(phases)
+            planned_phase_subtasks, planning_cancelled = _plan_detailed_subtasks_for_phases(
+                phases_to_plan=phases,
+                attempt=critique_attempt + 1,
+            )
+            if planning_cancelled:
+                return
+
+        if not critique_passed:
+            raise ValueError(
+                "Planning critique rejected the plan after "
+                f"{_MAX_PLANNING_REFINEMENT_ATTEMPTS} attempts."
+            )
         _update_job_result_state(
             app=app,
             job_id=job_id,
-            updates={"current_task": f"Planning complete: {len(phases)} phases"},
-            append_hook=f"Planning complete with {len(phases)} phases.",
+            updates={"current_task": f"Planning complete: {phase_total} phases"},
+            append_hook=(
+                "Planning complete with "
+                f"{phase_total} phases, detailed subtasks, and a passing Codex critique."
+            ),
         )
 
         recovery_command, recovery_validations, recovery_source = _select_post_heal_commands(
@@ -1756,17 +2904,36 @@ def _execute_program_job(app: FastAPI, job_id: str) -> None:
             product_spec_payload=product_spec_payload,
             task_plan_payload=task_plan_payload,
         )
+        (
+            global_recovery_command,
+            global_recovery_validations,
+            global_recovery_source,
+        ) = _resolve_phase_recovery_commands(
+            workspace=job.workspace,
+            task_plan_payload=task_plan_payload,
+            phase_index=0,
+            fallback_primary_command=recovery_command,
+            fallback_validation_commands=recovery_validations,
+            fallback_source=recovery_source,
+        )
 
         orchestrator = _build_orchestrator(
             workspace=job.workspace,
             role_provider_map=app.state.role_provider_map,
+            timeout_config=timeout_config,
+            full_capability_mode=full_capability_mode,
         )
         phase_results: list[dict[str, Any]] = []
-        phase_total = len(phases)
         overall_success = True
         self_heal_summary: dict[str, Any] | None = None
+        posthoc_planning_summary: dict[str, Any] | None = None
+        program_started_perf = time.perf_counter()
+        phase_benchmark_rows: list[dict[str, Any]] = []
+        subtask_duration_rows: list[float] = []
 
         for phase_index, phase_requirement in enumerate(phases, start=1):
+            phase_started_perf = time.perf_counter()
+            phase_started_at = _utc_now_iso()
             if _is_job_cancel_requested(app, job_id):
                 _finalize_job_cancelled(
                     app=app,
@@ -1782,37 +2949,29 @@ def _execute_program_job(app: FastAPI, job_id: str) -> None:
                 relative_name=f"{phase_base_name}_requirement.md",
                 content=f"{phase_requirement.rstrip()}\n",
             )
-            _update_job_result_state(
-                app=app,
-                job_id=job_id,
-                updates={"current_task": f"Generating subtasks for phase {phase_index}/{phase_total}"},
-                append_hook=f"Requesting Gemini subtask breakdown for phase {phase_index}/{phase_total}.",
+            planned_phase = planned_phase_subtasks.get(phase_index) or {}
+            planned_subtasks = planned_phase.get("subtasks")
+            if isinstance(planned_subtasks, list):
+                subtasks = [
+                    str(item).strip()
+                    for item in planned_subtasks
+                    if str(item).strip()
+                ]
+            else:
+                subtasks = []
+            if not subtasks:
+                subtasks = [phase_requirement]
+            subtask_plan_source = str(
+                planned_phase.get("subtask_plan_source") or "planning_missing_fallback"
             )
-            subtasks, subtask_plan_prompt, subtask_plan_response, subtask_plan_source = _derive_subtasks_with_architect(
-                architect_client=architect_client,
-                phase_requirement=phase_requirement,
-                max_subtasks=max_subtasks_per_phase,
-            )
-            subtask_plan_prompt_file = _write_report_text(
-                workspace=job.workspace,
-                report_dir=report_dir,
-                relative_name=f"{phase_base_name}_subtask_plan_prompt.txt",
-                content=f"{subtask_plan_prompt.rstrip()}\n",
-            )
-            subtask_plan_response_file: str | None = None
-            if isinstance(subtask_plan_response, str) and subtask_plan_response.strip():
-                subtask_plan_response_file = _write_report_text(
-                    workspace=job.workspace,
-                    report_dir=report_dir,
-                    relative_name=f"{phase_base_name}_subtask_plan_response.txt",
-                    content=f"{subtask_plan_response.rstrip()}\n",
-                )
+            subtask_plan_prompt_file = planned_phase.get("subtask_plan_prompt_file")
+            subtask_plan_response_file = planned_phase.get("subtask_plan_response_file")
             _update_job_result_state(
                 app=app,
                 job_id=job_id,
                 updates={
                     "success": None,
-                    "stage": "phase_execution",
+                    "stage": "phase_coding",
                     "phase_current": phase_index,
                     "phase_total": phase_total,
                     "subtask_current": 0,
@@ -1824,7 +2983,7 @@ def _execute_program_job(app: FastAPI, job_id: str) -> None:
                     "current_task": f"Phase {phase_index}/{phase_total} ready ({len(subtasks)} subtasks)",
                 },
                 append_hook=(
-                    f"Starting phase {phase_index}/{phase_total} with {len(subtasks)} subtasks "
+                    f"Starting execution for phase {phase_index}/{phase_total} with {len(subtasks)} subtasks "
                     f"(source={subtask_plan_source})."
                 ),
             )
@@ -1833,16 +2992,40 @@ def _execute_program_job(app: FastAPI, job_id: str) -> None:
                 for candidate in job.workspace.glob("*.mermaid")
                 if candidate.is_file()
             }
+            baseline_dashboard = {
+                candidate.resolve()
+                for candidate in job.workspace.glob("*.dashboard.html")
+                if candidate.is_file()
+            }
+            baseline_dashboard_json = {
+                candidate.resolve()
+                for candidate in job.workspace.glob("*.dashboard.json")
+                if candidate.is_file()
+            }
             codebase_summary = workspace_summary_text
             codebase_summary = (
                 f"{codebase_summary}\n\n"
                 f"Program execution context: phase {phase_index}/{phase_total}."
+            )
+            (
+                phase_recovery_command,
+                phase_recovery_validations,
+                phase_recovery_source,
+            ) = _resolve_phase_recovery_commands(
+                workspace=job.workspace,
+                task_plan_payload=task_plan_payload,
+                phase_index=phase_index,
+                fallback_primary_command=global_recovery_command,
+                fallback_validation_commands=global_recovery_validations,
+                fallback_source=global_recovery_source,
             )
             phase_success = True
             subtask_results: list[dict[str, Any]] = []
             subtask_prompt_files: list[str] = []
 
             for subtask_index, subtask_requirement in enumerate(subtasks, start=1):
+                subtask_started_perf = time.perf_counter()
+                subtask_started_at = _utc_now_iso()
                 if _is_job_cancel_requested(app, job_id):
                     _finalize_job_cancelled(
                         app=app,
@@ -1855,7 +3038,7 @@ def _execute_program_job(app: FastAPI, job_id: str) -> None:
                     app=app,
                     job_id=job_id,
                     updates={
-                        "stage": "phase_execution",
+                        "stage": "phase_coding",
                         "phase_current": phase_index,
                         "phase_total": phase_total,
                         "subtask_current": subtask_index,
@@ -1908,10 +3091,19 @@ def _execute_program_job(app: FastAPI, job_id: str) -> None:
                         current = app.state.jobs.get(job_id)
                         if current is not None:
                             current.status = "running"
-                    subtask_success = orchestrator.execute_feature_request(
-                        requirement=subtask_requirement,
-                        codebase_summary=codebase_summary,
-                        workspace=job.workspace,
+                    subtask_success = _run_with_heartbeat(
+                        app=app,
+                        job_id=job_id,
+                        hook_label=(
+                            f"Executing phase {phase_index}/{phase_total} "
+                            f"subtask {subtask_index}/{len(subtasks)}"
+                        ),
+                        run_callable=lambda: orchestrator.execute_feature_request(
+                            requirement=subtask_requirement,
+                            codebase_summary=codebase_summary,
+                            workspace=job.workspace,
+                            fast_mode=fast_mode,
+                        ),
                     )
 
                 subtask_result: dict[str, Any] = {
@@ -1919,15 +3111,21 @@ def _execute_program_job(app: FastAPI, job_id: str) -> None:
                     "subtask_total": len(subtasks),
                     "success": subtask_success,
                     "requirement_preview": subtask_requirement[:240],
+                    "started_at": subtask_started_at,
                 }
                 subtask_results.append(subtask_result)
 
                 if subtask_success:
+                    subtask_duration = round(time.perf_counter() - subtask_started_perf, 3)
+                    subtask_result["completed_at"] = _utc_now_iso()
+                    subtask_result["duration_seconds"] = subtask_duration
+                    subtask_duration_rows.append(subtask_duration)
                     _update_job_result_state(
                         app=app,
                         job_id=job_id,
                         append_hook=(
-                            f"Subtask {subtask_index}/{len(subtasks)} completed."
+                            f"Subtask {subtask_index}/{len(subtasks)} completed "
+                            f"in {subtask_duration}s."
                         ),
                     )
                     continue
@@ -1940,6 +3138,23 @@ def _execute_program_job(app: FastAPI, job_id: str) -> None:
                         "Triggering Codex recovery."
                     ),
                 )
+                failure_details = _extract_orchestrator_failure_details(
+                    workspace=job.workspace,
+                    baseline_dashboard_json=baseline_dashboard_json,
+                )
+                if failure_details is not None:
+                    subtask_result["orchestrator_failure"] = failure_details
+                    failure_summary = str(failure_details.get("summary", "")).strip()
+                    if failure_summary:
+                        subtask_result["failure_reason"] = failure_summary
+                        _update_job_result_state(
+                            app=app,
+                            job_id=job_id,
+                            append_hook=(
+                                "Subtask failure reason: "
+                                f"{failure_summary[:280]}"
+                            ),
+                        )
 
                 with app.state.execution_lock:
                     _update_job_result_state(
@@ -1947,28 +3162,36 @@ def _execute_program_job(app: FastAPI, job_id: str) -> None:
                         job_id=job_id,
                         updates={"current_task": "Codex recovery"},
                         append_hook=(
-                            f"Running Codex recovery command: {recovery_command}"
+                            f"Running Codex recovery command: {phase_recovery_command}"
                         ),
                     )
                     recovery_agent = create_default_senior_agent(
                         provider="codex",
                         workspace=job.workspace,
                         max_attempts=4,
-                        validation_commands=recovery_validations,
+                        timeout_seconds=timeout_config["codex"],
+                        validation_commands=phase_recovery_validations,
+                        adaptive_strategy_ordering=True,
+                        enable_verification_cache=True,
                     )
-                    recovery_report = recovery_agent.heal(
-                        command=recovery_command,
-                        workspace=job.workspace,
-                        validation_commands=recovery_validations,
+                    recovery_report = _run_with_heartbeat(
+                        app=app,
+                        job_id=job_id,
+                        hook_label="Codex recovery in progress",
+                        run_callable=lambda: recovery_agent.heal(
+                            command=phase_recovery_command,
+                            workspace=job.workspace,
+                            validation_commands=phase_recovery_validations,
+                        ),
                     )
 
                 subtask_result["codex_recovery"] = {
                     "success": recovery_report.success,
                     "blocked_reason": recovery_report.blocked_reason,
                     "attempts": len(recovery_report.attempts),
-                    "command": recovery_command,
-                    "validation_commands": recovery_validations,
-                    "command_source": recovery_source,
+                    "command": phase_recovery_command,
+                    "validation_commands": phase_recovery_validations,
+                    "command_source": phase_recovery_source,
                 }
 
                 if recovery_report.success:
@@ -1981,20 +3204,33 @@ def _execute_program_job(app: FastAPI, job_id: str) -> None:
                         ),
                     )
                     with app.state.execution_lock:
-                        retry_success = orchestrator.execute_feature_request(
-                            requirement=subtask_requirement,
-                            codebase_summary=codebase_summary,
-                            workspace=job.workspace,
+                        retry_success = _run_with_heartbeat(
+                            app=app,
+                            job_id=job_id,
+                            hook_label=(
+                                f"Retrying phase {phase_index}/{phase_total} "
+                                f"subtask {subtask_index}/{len(subtasks)}"
+                            ),
+                            run_callable=lambda: orchestrator.execute_feature_request(
+                                requirement=subtask_requirement,
+                                codebase_summary=codebase_summary,
+                                workspace=job.workspace,
+                                fast_mode=fast_mode,
+                            ),
                         )
                     subtask_result["retried_after_recovery"] = True
                     subtask_result["success"] = retry_success
                     if retry_success:
+                        subtask_duration = round(time.perf_counter() - subtask_started_perf, 3)
+                        subtask_result["completed_at"] = _utc_now_iso()
+                        subtask_result["duration_seconds"] = subtask_duration
+                        subtask_duration_rows.append(subtask_duration)
                         _update_job_result_state(
                             app=app,
                             job_id=job_id,
                             append_hook=(
                                 f"Subtask {subtask_index}/{len(subtasks)} "
-                                "passed after Codex recovery."
+                                f"passed after Codex recovery in {subtask_duration}s."
                             ),
                         )
                         continue
@@ -2017,12 +3253,16 @@ def _execute_program_job(app: FastAPI, job_id: str) -> None:
                     )
 
                 phase_success = False
+                subtask_duration = round(time.perf_counter() - subtask_started_perf, 3)
+                subtask_result["completed_at"] = _utc_now_iso()
+                subtask_result["duration_seconds"] = subtask_duration
+                subtask_duration_rows.append(subtask_duration)
                 _update_job_result_state(
                     app=app,
                     job_id=job_id,
                     append_hook=(
                         f"Phase {phase_index}/{phase_total} stopped after failed "
-                        f"subtask {subtask_index}/{len(subtasks)}."
+                        f"subtask {subtask_index}/{len(subtasks)} in {subtask_duration}s."
                     ),
                 )
                 break
@@ -2035,12 +3275,208 @@ def _execute_program_job(app: FastAPI, job_id: str) -> None:
                 )
                 return
 
+            phase_batch_validation: dict[str, Any] | None = None
+            if phase_success and full_capability_mode:
+                phase_batch_validation = {
+                    "skipped": True,
+                    "success": True,
+                    "summary": "Skipped strict phase validation in full_capability_mode.",
+                }
+                _update_job_result_state(
+                    app=app,
+                    job_id=job_id,
+                    updates={
+                        "stage": "phase_review",
+                        "phase_current": phase_index,
+                        "phase_total": phase_total,
+                        "current_task": f"Phase {phase_index}/{phase_total} review (checks disabled)",
+                    },
+                    append_hook=(
+                        f"Phase {phase_index}/{phase_total}: skipped strict phase validation "
+                        "in full_capability_mode."
+                    ),
+                )
+            elif phase_success:
+                _update_job_result_state(
+                    app=app,
+                    job_id=job_id,
+                    updates={
+                        "stage": "phase_review",
+                        "phase_current": phase_index,
+                        "phase_total": phase_total,
+                        "current_task": f"Phase {phase_index}/{phase_total} batch validation",
+                    },
+                    append_hook=(
+                        f"Running strict phase-level validation command: {phase_recovery_command}"
+                    ),
+                )
+                validation_result = _run_with_heartbeat(
+                    app=app,
+                    job_id=job_id,
+                    hook_label=f"Phase {phase_index}/{phase_total} validation",
+                    run_callable=lambda: run_shell_command(phase_recovery_command, job.workspace),
+                )
+                phase_batch_validation = {
+                    "command": phase_recovery_command,
+                    "return_code": validation_result.return_code,
+                    "success": validation_result.return_code == 0,
+                    "stdout": validation_result.stdout,
+                    "stderr": validation_result.stderr,
+                }
+                if validation_result.return_code != 0:
+                    phase_success = False
+                    _update_job_result_state(
+                        app=app,
+                        job_id=job_id,
+                        append_hook=(
+                            f"Phase {phase_index}/{phase_total} failed batch validation "
+                            f"with return code {validation_result.return_code}."
+                        ),
+                    )
+
+            gatekeeper_review: dict[str, Any] | None = None
+            gatekeeper_prompt_file: str | None = None
+            gatekeeper_response_file: str | None = None
+            if phase_success and full_capability_mode:
+                gatekeeper_review = {
+                    "success": True,
+                    "status": "pass",
+                    "summary": "Skipped strict gatekeeper review in full_capability_mode.",
+                    "findings": [],
+                    "prompt_file": None,
+                    "response_file": None,
+                }
+                _update_job_result_state(
+                    app=app,
+                    job_id=job_id,
+                    append_hook=(
+                        f"Phase {phase_index}/{phase_total}: skipped strict gatekeeper review "
+                        "in full_capability_mode."
+                    ),
+                )
+            elif phase_success and code_first_mode:
+                gatekeeper_review = {
+                    "success": True,
+                    "status": "pass",
+                    "summary": (
+                        "Code-first mode skipped synchronous gatekeeper review for this phase."
+                    ),
+                    "findings": [],
+                    "prompt_file": None,
+                    "response_file": None,
+                }
+                _update_job_result_state(
+                    app=app,
+                    job_id=job_id,
+                    append_hook=(
+                        f"Phase {phase_index}/{phase_total}: skipped synchronous "
+                        "gatekeeper review in code-first mode."
+                    ),
+                )
+            elif phase_success:
+                gatekeeper_prompt = _build_phase_gatekeeper_prompt(
+                    phase_number=phase_index,
+                    phase_total=phase_total,
+                    phase_requirement=phase_requirement,
+                    subtask_results=subtask_results,
+                    validation_result=phase_batch_validation,
+                )
+                gatekeeper_prompt_file = _write_report_text(
+                    workspace=job.workspace,
+                    report_dir=report_dir,
+                    relative_name=f"{phase_base_name}_gatekeeper_prompt.txt",
+                    content=f"{gatekeeper_prompt.rstrip()}\n",
+                )
+                _update_job_result_state(
+                    app=app,
+                    job_id=job_id,
+                    updates={
+                        "stage": "phase_review",
+                        "phase_current": phase_index,
+                        "phase_total": phase_total,
+                        "current_task": f"Phase {phase_index}/{phase_total} gatekeeper review",
+                    },
+                    append_hook=f"Running strict gatekeeper review for phase {phase_index}/{phase_total}.",
+                )
+                try:
+                    gatekeeper_raw = _run_with_heartbeat(
+                        app=app,
+                        job_id=job_id,
+                        hook_label=f"Gatekeeper reviewing phase {phase_index}/{phase_total}",
+                        run_callable=lambda: architect_client.generate_fix(gatekeeper_prompt),
+                    )
+                    gatekeeper_response_file = _write_report_text(
+                        workspace=job.workspace,
+                        report_dir=report_dir,
+                        relative_name=f"{phase_base_name}_gatekeeper_response.txt",
+                        content=f"{gatekeeper_raw.rstrip()}\n",
+                    )
+                    gatekeeper_review = _evaluate_gatekeeper_response(gatekeeper_raw)
+                except LLMClientError as exc:
+                    gatekeeper_review = {
+                        "success": False,
+                        "status": "fail",
+                        "summary": f"Gatekeeper review failed due to LLM error: {exc}",
+                        "findings": [],
+                    }
+                except Exception as exc:  # pragma: no cover - defensive guardrail
+                    gatekeeper_review = {
+                        "success": False,
+                        "status": "fail",
+                        "summary": f"Gatekeeper review failed unexpectedly: {exc}",
+                        "findings": [],
+                    }
+
+                if gatekeeper_review is None:
+                    gatekeeper_review = {
+                        "success": False,
+                        "status": "fail",
+                        "summary": "Gatekeeper review returned no result.",
+                        "findings": [],
+                    }
+                gatekeeper_review["prompt_file"] = gatekeeper_prompt_file
+                gatekeeper_review["response_file"] = gatekeeper_response_file
+                if not bool(gatekeeper_review.get("success")):
+                    phase_success = False
+                    _update_job_result_state(
+                        app=app,
+                        job_id=job_id,
+                        append_hook=(
+                            f"Phase {phase_index}/{phase_total} rejected by gatekeeper: "
+                            f"{gatekeeper_review.get('summary', 'no summary')}."
+                        ),
+                    )
+                else:
+                    _update_job_result_state(
+                        app=app,
+                        job_id=job_id,
+                        append_hook=f"Phase {phase_index}/{phase_total} passed gatekeeper review.",
+                    )
+
+            phase_duration_seconds = round(time.perf_counter() - phase_started_perf, 3)
+            phase_completed_at = _utc_now_iso()
+            phase_benchmark_rows.append(
+                {
+                    "phase_number": phase_index,
+                    "subtasks_total": len(subtasks),
+                    "subtasks_completed": sum(
+                        1 for item in subtask_results if bool(item.get("success"))
+                    ),
+                    "duration_seconds": phase_duration_seconds,
+                    "started_at": phase_started_at,
+                    "completed_at": phase_completed_at,
+                    "success": phase_success,
+                }
+            )
+
             mermaid_path = _find_latest_mermaid_path(job.workspace, baseline_mermaid)
+            dashboard_path = _find_latest_dashboard_path(job.workspace, baseline_dashboard)
             phase_result_payload = {
                 "phase_number": phase_index,
                 "phase_total": phase_total,
                 "success": phase_success,
                 "mermaid_path": mermaid_path,
+                "dashboard_path": dashboard_path,
                 "requirement_preview": phase_requirement[:240],
                 "requirement_file": phase_requirement_file,
                 "subtask_plan_prompt_file": subtask_plan_prompt_file,
@@ -2050,6 +3486,12 @@ def _execute_program_job(app: FastAPI, job_id: str) -> None:
                 "subtasks_completed": sum(
                     1 for item in subtask_results if bool(item.get("success"))
                 ),
+                "fast_mode": fast_mode,
+                "phase_batch_validation": phase_batch_validation,
+                "gatekeeper_review": gatekeeper_review,
+                "started_at": phase_started_at,
+                "completed_at": phase_completed_at,
+                "duration_seconds": phase_duration_seconds,
                 "subtask_prompt_files": subtask_prompt_files,
                 "subtasks": subtask_results,
             }
@@ -2066,41 +3508,72 @@ def _execute_program_job(app: FastAPI, job_id: str) -> None:
                 phase_success=phase_success,
                 mermaid_path=mermaid_path,
             )
-            _update_job_result_state(
-                app=app,
-                job_id=job_id,
-                updates={"current_task": f"Generating phase {phase_index}/{phase_total} review"},
-                append_hook=f"Generating review for phase {phase_index}/{phase_total}.",
-            )
             _write_report_text(
                 workspace=job.workspace,
                 report_dir=report_dir,
                 relative_name=f"{phase_base_name}_review_prompt.txt",
                 content=f"{phase_review_prompt.rstrip()}\n",
             )
-            try:
-                if _is_job_cancel_requested(app, job_id):
-                    _finalize_job_cancelled(
-                        app=app,
-                        job_id=job_id,
-                        message=f"Cancelled before phase {phase_index} review generation.",
-                    )
-                    return
-                phase_review_text = architect_client.generate_fix(phase_review_prompt)
-            except LLMClientError as exc:
+            if code_first_mode:
                 _update_job_result_state(
                     app=app,
                     job_id=job_id,
-                    append_hook=f"Review generation fallback used: {exc}",
+                    updates={
+                        "stage": "phase_review",
+                        "phase_current": phase_index,
+                        "phase_total": phase_total,
+                        "current_task": f"Phase {phase_index}/{phase_total} code-first review",
+                    },
+                    append_hook=(
+                        f"Phase {phase_index}/{phase_total}: deferred architect review "
+                        "to prioritize coding throughput."
+                    ),
                 )
-                phase_review_text = (
-                    "## Outcome\n"
-                    f"- Review generation unavailable: {exc}\n\n"
-                    "## Risks\n"
-                    "- Manual review recommended for this phase.\n\n"
-                    "## Recommended Next Step\n"
-                    "- Inspect generated files and run validation commands.\n"
+                phase_review_text = _code_first_phase_review_text(
+                    phase_number=phase_index,
+                    phase_total=phase_total,
+                    phase_success=phase_success,
                 )
+            else:
+                _update_job_result_state(
+                    app=app,
+                    job_id=job_id,
+                    updates={
+                        "stage": "phase_review",
+                        "phase_current": phase_index,
+                        "phase_total": phase_total,
+                        "current_task": f"Generating phase {phase_index}/{phase_total} review",
+                    },
+                    append_hook=f"Generating review for phase {phase_index}/{phase_total}.",
+                )
+                try:
+                    if _is_job_cancel_requested(app, job_id):
+                        _finalize_job_cancelled(
+                            app=app,
+                            job_id=job_id,
+                            message=f"Cancelled before phase {phase_index} review generation.",
+                        )
+                        return
+                    phase_review_text = _run_with_heartbeat(
+                        app=app,
+                        job_id=job_id,
+                        hook_label=f"Architect generating review for phase {phase_index}/{phase_total}",
+                        run_callable=lambda: architect_client.generate_fix(phase_review_prompt),
+                    )
+                except LLMClientError as exc:
+                    _update_job_result_state(
+                        app=app,
+                        job_id=job_id,
+                        append_hook=f"Review generation fallback used: {exc}",
+                    )
+                    phase_review_text = (
+                        "## Outcome\n"
+                        f"- Review generation unavailable: {exc}\n\n"
+                        "## Risks\n"
+                        "- Manual review recommended for this phase.\n\n"
+                        "## Recommended Next Step\n"
+                        "- Inspect generated files and run validation commands.\n"
+                    )
             phase_review_file = _write_report_text(
                 workspace=job.workspace,
                 report_dir=report_dir,
@@ -2113,6 +3586,7 @@ def _execute_program_job(app: FastAPI, job_id: str) -> None:
                     "phase_total": phase_total,
                     "success": phase_success,
                     "mermaid_path": mermaid_path,
+                    "dashboard_path": dashboard_path,
                     "requirement_preview": phase_requirement[:240],
                     "requirement_file": phase_requirement_file,
                     "result_file": phase_result_file,
@@ -2128,12 +3602,134 @@ def _execute_program_job(app: FastAPI, job_id: str) -> None:
                 },
                 append_hook=(
                     f"Phase {phase_index}/{phase_total} "
-                    f"{'completed' if phase_success else 'failed'}."
+                    f"{'completed' if phase_success else 'failed'} "
+                    f"in {phase_duration_seconds}s."
                 ),
             )
             if not phase_success:
                 overall_success = False
                 break
+
+        if code_first_mode:
+            if _is_job_cancel_requested(app, job_id):
+                _finalize_job_cancelled(
+                    app=app,
+                    job_id=job_id,
+                    message="Cancelled before post-hoc planning artifacts.",
+                )
+                return
+
+            _update_job_result_state(
+                app=app,
+                job_id=job_id,
+                updates={
+                    "stage": "posthoc_planning",
+                    "phase_current": len(phase_results),
+                    "phase_total": phase_total,
+                    "current_task": "Generating post-hoc planning artifacts",
+                },
+                append_hook=(
+                    "Code-first mode: generating architect planning artifacts after execution."
+                ),
+            )
+
+            posthoc_spec_prompt = product_spec_prompt
+            posthoc_spec_prompt_file = _write_report_text(
+                workspace=job.workspace,
+                report_dir=report_dir,
+                relative_name="91_posthoc_product_spec_prompt.txt",
+                content=f"{posthoc_spec_prompt.rstrip()}\n",
+            )
+            posthoc_spec_source = "architect"
+            try:
+                posthoc_spec_raw = _run_with_heartbeat(
+                    app=app,
+                    job_id=job_id,
+                    hook_label="Architect generating post-hoc product spec",
+                    run_callable=lambda: architect_client.generate_fix(posthoc_spec_prompt),
+                )
+            except LLMClientError as exc:
+                planning_notes.append(f"Post-hoc product spec fallback used: {exc}")
+                posthoc_spec_source = f"fallback_llm_error:{exc}"
+                posthoc_spec_raw = json.dumps(
+                    _default_product_spec(requirement),
+                    indent=2,
+                    ensure_ascii=True,
+                )
+
+            posthoc_spec_response_file = _write_report_text(
+                workspace=job.workspace,
+                report_dir=report_dir,
+                relative_name="91_posthoc_product_spec_response.txt",
+                content=f"{posthoc_spec_raw.rstrip()}\n",
+            )
+            posthoc_spec_payload = _parse_json_object(posthoc_spec_raw) or _default_product_spec(
+                requirement
+            )
+            posthoc_spec_payload["source"] = posthoc_spec_source
+            posthoc_spec_payload["prompt_file"] = posthoc_spec_prompt_file
+            posthoc_spec_payload["raw_response_file"] = posthoc_spec_response_file
+            posthoc_product_spec_file = _write_report_json(
+                workspace=job.workspace,
+                report_dir=report_dir,
+                relative_name="91_posthoc_product_spec.json",
+                payload=posthoc_spec_payload,
+            )
+
+            posthoc_task_prompt = _build_task_plan_prompt(
+                json.dumps(posthoc_spec_payload, indent=2, ensure_ascii=True),
+                max_phases,
+            )
+            posthoc_task_prompt_file = _write_report_text(
+                workspace=job.workspace,
+                report_dir=report_dir,
+                relative_name="92_posthoc_task_plan_prompt.txt",
+                content=f"{posthoc_task_prompt.rstrip()}\n",
+            )
+            posthoc_task_source = "architect"
+            try:
+                posthoc_task_raw = _run_with_heartbeat(
+                    app=app,
+                    job_id=job_id,
+                    hook_label="Architect generating post-hoc task plan",
+                    run_callable=lambda: architect_client.generate_fix(posthoc_task_prompt),
+                )
+            except LLMClientError as exc:
+                planning_notes.append(f"Post-hoc task plan fallback used: {exc}")
+                posthoc_task_source = f"fallback_llm_error:{exc}"
+                posthoc_task_raw = ""
+
+            posthoc_task_response_file = _write_report_text(
+                workspace=job.workspace,
+                report_dir=report_dir,
+                relative_name="92_posthoc_task_plan_response.txt",
+                content=f"{posthoc_task_raw.rstrip()}\n",
+            )
+            posthoc_task_payload = _parse_json_object(posthoc_task_raw) or _default_task_plan(
+                requirement,
+                max_phases,
+            )
+            posthoc_task_payload["source"] = posthoc_task_source
+            posthoc_task_payload["prompt_file"] = posthoc_task_prompt_file
+            posthoc_task_payload["raw_response_file"] = posthoc_task_response_file
+            posthoc_task_plan_file = _write_report_json(
+                workspace=job.workspace,
+                report_dir=report_dir,
+                relative_name="92_posthoc_task_plan.json",
+                payload=posthoc_task_payload,
+            )
+            posthoc_planning_summary = {
+                "success": bool(
+                    posthoc_spec_source == "architect"
+                    and posthoc_task_source == "architect"
+                ),
+                "product_spec_file": posthoc_product_spec_file,
+                "task_plan_file": posthoc_task_plan_file,
+                "product_spec_source": posthoc_spec_source,
+                "task_plan_source": posthoc_task_source,
+            }
+            product_spec_file = posthoc_product_spec_file
+            task_plan_file = posthoc_task_plan_file
 
         if overall_success:
             if _is_job_cancel_requested(app, job_id):
@@ -2144,122 +3740,186 @@ def _execute_program_job(app: FastAPI, job_id: str) -> None:
                 )
                 return
 
-            post_heal_command = recovery_command
-            post_heal_validations = recovery_validations
-            command_source = recovery_source
-            self_heal_request_payload = {
-                "command": post_heal_command,
-                "validation_commands": post_heal_validations,
-                "command_source": command_source,
-                "max_attempts": 4,
-            }
-            self_heal_request_file = _write_report_json(
-                workspace=job.workspace,
-                report_dir=report_dir,
-                relative_name="90_self_heal_request.json",
-                payload=self_heal_request_payload,
-            )
+            if full_capability_mode:
+                self_heal_summary = {
+                    "success": True,
+                    "skipped": True,
+                    "summary": "Post-run self-heal skipped in full_capability_mode.",
+                }
+                _update_job_result_state(
+                    app=app,
+                    job_id=job_id,
+                    append_hook="Skipped post-run self-heal in full_capability_mode.",
+                )
+            else:
+                post_heal_command = global_recovery_command
+                post_heal_validations = global_recovery_validations
+                command_source = global_recovery_source
+                self_heal_request_payload = {
+                    "command": post_heal_command,
+                    "validation_commands": post_heal_validations,
+                    "command_source": command_source,
+                    "max_attempts": 4,
+                    "timeout_seconds": _timeout_for_provider(
+                        app.state.role_provider_map.get("developer", app.state.provider),
+                        timeout_config,
+                    ),
+                    "adaptive_strategy_ordering": True,
+                    "enable_verification_cache": True,
+                }
+                self_heal_request_file = _write_report_json(
+                    workspace=job.workspace,
+                    report_dir=report_dir,
+                    relative_name="90_self_heal_request.json",
+                    payload=self_heal_request_payload,
+                )
 
-            _update_job_result_state(
-                app=app,
-                job_id=job_id,
-                updates={
-                    "success": None,
-                    "stage": "self_heal",
-                    "phase_total": phase_total,
-                    "phase_completed": len(phase_results),
-                    "reports_dir": report_dir_relative,
-                    "phase_results": list(phase_results),
-                    "self_heal_request_file": self_heal_request_file,
-                    "current_task": "Running post-run self-heal",
-                },
-                append_hook="Starting post-run self-heal pass.",
-            )
+                _update_job_result_state(
+                    app=app,
+                    job_id=job_id,
+                    updates={
+                        "success": None,
+                        "stage": "self_heal",
+                        "phase_total": phase_total,
+                        "phase_completed": len(phase_results),
+                        "reports_dir": report_dir_relative,
+                        "phase_results": list(phase_results),
+                        "self_heal_request_file": self_heal_request_file,
+                        "current_task": "Running post-run self-heal",
+                    },
+                    append_hook="Starting post-run self-heal pass.",
+                )
 
-            with app.state.execution_lock:
+                with app.state.execution_lock:
+                    if _is_job_cancel_requested(app, job_id):
+                        _finalize_job_cancelled(
+                            app=app,
+                            job_id=job_id,
+                            message="Cancelled before self-heal execution.",
+                        )
+                        return
+                    with app.state.jobs_lock:
+                        current = app.state.jobs.get(job_id)
+                        if current is not None:
+                            current.status = "running"
+                    developer_provider = app.state.role_provider_map.get("developer", app.state.provider)
+                    heal_agent = create_default_senior_agent(
+                        provider=developer_provider,
+                        workspace=job.workspace,
+                        max_attempts=4,
+                        timeout_seconds=_timeout_for_provider(developer_provider, timeout_config),
+                        validation_commands=post_heal_validations,
+                        adaptive_strategy_ordering=True,
+                        enable_verification_cache=True,
+                    )
+                    heal_report = _run_with_heartbeat(
+                        app=app,
+                        job_id=job_id,
+                        hook_label="Post-run self-heal in progress",
+                        run_callable=lambda: heal_agent.heal(
+                            command=post_heal_command,
+                            workspace=job.workspace,
+                            validation_commands=post_heal_validations,
+                        ),
+                    )
+                _update_job_result_state(
+                    app=app,
+                    job_id=job_id,
+                    append_hook=(
+                        "Post-run self-heal completed: "
+                        f"{'success' if heal_report.success else 'failed'}."
+                    ),
+                )
+
                 if _is_job_cancel_requested(app, job_id):
                     _finalize_job_cancelled(
                         app=app,
                         job_id=job_id,
-                        message="Cancelled before self-heal execution.",
+                        message="Cancelled after self-heal execution.",
                     )
                     return
-                with app.state.jobs_lock:
-                    current = app.state.jobs.get(job_id)
-                    if current is not None:
-                        current.status = "running"
-                heal_agent = create_default_senior_agent(
-                    provider=app.state.role_provider_map.get("developer", app.state.provider),
-                    workspace=job.workspace,
-                    max_attempts=4,
-                    validation_commands=post_heal_validations,
-                )
-                heal_report = heal_agent.heal(
-                    command=post_heal_command,
-                    workspace=job.workspace,
-                    validation_commands=post_heal_validations,
-                )
-            _update_job_result_state(
-                app=app,
-                job_id=job_id,
-                append_hook=(
-                    "Post-run self-heal completed: "
-                    f"{'success' if heal_report.success else 'failed'}."
-                ),
-            )
 
-            if _is_job_cancel_requested(app, job_id):
-                _finalize_job_cancelled(
-                    app=app,
-                    job_id=job_id,
-                    message="Cancelled after self-heal execution.",
+                self_heal_report_payload = heal_report.to_dict()
+                self_heal_report_payload["command_source"] = command_source
+                self_heal_report_file = _write_report_json(
+                    workspace=job.workspace,
+                    report_dir=report_dir,
+                    relative_name="90_self_heal_report.json",
+                    payload=self_heal_report_payload,
                 )
-                return
+                self_heal_review_text = (
+                    "## Outcome\n"
+                    f"- Success: {heal_report.success}\n"
+                    f"- Command: `{post_heal_command}`\n"
+                    f"- Attempts: {len(heal_report.attempts)}\n\n"
+                    "## Validation\n"
+                    f"- Additional commands: {post_heal_validations or ['none']}\n"
+                    f"- Blocked reason: {heal_report.blocked_reason or 'none'}\n\n"
+                    "## Recommended Next Step\n"
+                    "- Inspect `90_self_heal_report.json` and re-run project validations.\n"
+                )
+                self_heal_review_file = _write_report_text(
+                    workspace=job.workspace,
+                    report_dir=report_dir,
+                    relative_name="90_self_heal_review.md",
+                    content=self_heal_review_text,
+                )
+                self_heal_summary = {
+                    "success": heal_report.success,
+                    "blocked_reason": heal_report.blocked_reason,
+                    "attempts": len(heal_report.attempts),
+                    "command": post_heal_command,
+                    "validation_commands": post_heal_validations,
+                    "command_source": command_source,
+                    "request_file": self_heal_request_file,
+                    "report_file": self_heal_report_file,
+                    "review_file": self_heal_review_file,
+                }
+                if not heal_report.success:
+                    overall_success = False
 
-            self_heal_report_payload = heal_report.to_dict()
-            self_heal_report_payload["command_source"] = command_source
-            self_heal_report_file = _write_report_json(
-                workspace=job.workspace,
-                report_dir=report_dir,
-                relative_name="90_self_heal_report.json",
-                payload=self_heal_report_payload,
+        total_program_duration = round(time.perf_counter() - program_started_perf, 3)
+        average_phase_duration = (
+            round(
+                sum(item["duration_seconds"] for item in phase_benchmark_rows)
+                / len(phase_benchmark_rows),
+                3,
             )
-            self_heal_review_text = (
-                "## Outcome\n"
-                f"- Success: {heal_report.success}\n"
-                f"- Command: `{post_heal_command}`\n"
-                f"- Attempts: {len(heal_report.attempts)}\n\n"
-                "## Validation\n"
-                f"- Additional commands: {post_heal_validations or ['none']}\n"
-                f"- Blocked reason: {heal_report.blocked_reason or 'none'}\n\n"
-                "## Recommended Next Step\n"
-                "- Inspect `90_self_heal_report.json` and re-run project validations.\n"
-            )
-            self_heal_review_file = _write_report_text(
-                workspace=job.workspace,
-                report_dir=report_dir,
-                relative_name="90_self_heal_review.md",
-                content=self_heal_review_text,
-            )
-            self_heal_summary = {
-                "success": heal_report.success,
-                "blocked_reason": heal_report.blocked_reason,
-                "attempts": len(heal_report.attempts),
-                "command": post_heal_command,
-                "validation_commands": post_heal_validations,
-                "command_source": command_source,
-                "request_file": self_heal_request_file,
-                "report_file": self_heal_report_file,
-                "review_file": self_heal_review_file,
-            }
-            if not heal_report.success:
-                overall_success = False
+            if phase_benchmark_rows
+            else 0.0
+        )
+        average_subtask_duration = (
+            round(sum(subtask_duration_rows) / len(subtask_duration_rows), 3)
+            if subtask_duration_rows
+            else 0.0
+        )
+        latest_mermaid_path = (
+            str(phase_results[-1].get("mermaid_path") or "").strip()
+            if phase_results
+            else ""
+        )
+        latest_dashboard_path = (
+            str(phase_results[-1].get("dashboard_path") or "").strip()
+            if phase_results
+            else ""
+        )
 
         summary_payload = {
             "success": overall_success,
             "phase_total": phase_total,
             "phase_completed": len(phase_results),
+            "fast_mode": fast_mode,
+            "code_first_mode": code_first_mode,
+            "full_capability_mode": full_capability_mode,
             "phase_results": phase_results,
+            "benchmarks": {
+                "program_duration_seconds": total_program_duration,
+                "phase_count_recorded": len(phase_benchmark_rows),
+                "subtask_count_recorded": len(subtask_duration_rows),
+                "average_phase_duration_seconds": average_phase_duration,
+                "average_subtask_duration_seconds": average_subtask_duration,
+                "phases": phase_benchmark_rows,
+            },
             "planning_notes": planning_notes,
             "role_providers": dict(app.state.role_provider_map),
             "workspace": str(job.workspace),
@@ -2268,7 +3928,10 @@ def _execute_program_job(app: FastAPI, job_id: str) -> None:
             "workspace_summary_file": workspace_summary_file,
             "product_spec_file": product_spec_file,
             "task_plan_file": task_plan_file,
+            "posthoc_planning": posthoc_planning_summary,
             "post_self_heal": self_heal_summary,
+            "mermaid_path": latest_mermaid_path or None,
+            "dashboard_path": latest_dashboard_path or None,
         }
         _update_job_result_state(
             app=app,
@@ -2298,6 +3961,8 @@ def _execute_program_job(app: FastAPI, job_id: str) -> None:
                 summary_payload["hooks"] = hooks
             existing.success = overall_success
             existing.status = "succeeded" if overall_success else "failed"
+            existing.mermaid_path = latest_mermaid_path or None
+            existing.dashboard_path = latest_dashboard_path or None
             existing.result = summary_payload
             existing.finished_at = _utc_now_iso()
     except Exception as exc:  # pragma: no cover - defensive guardrail
@@ -2347,11 +4012,15 @@ def _execute_heal_job(app: FastAPI, job_id: str) -> None:
         command = str(job.payload["command"])
         max_attempts = int(job.payload.get("max_attempts", 3))
         validation_commands = job.payload.get("validation_commands")
+        timeout_seconds = _normalize_timeout_seconds(job.payload.get("timeout_seconds"))
         _update_job_result_state(
             app=app,
             job_id=job_id,
             updates={"current_task": "Running self-heal command"},
-            append_hook="Starting self-heal execution with developer agent.",
+            append_hook=(
+                "Starting self-heal execution with developer agent "
+                f"(timeout={timeout_seconds}s)."
+            ),
         )
 
         with app.state.execution_lock:
@@ -2366,16 +4035,29 @@ def _execute_heal_job(app: FastAPI, job_id: str) -> None:
                 current = app.state.jobs.get(job_id)
                 if current is not None:
                     current.status = "running"
+            developer_provider = app.state.role_provider_map.get("developer", app.state.provider)
             agent = create_default_senior_agent(
-                provider=app.state.role_provider_map.get("developer", app.state.provider),
+                provider=developer_provider,
                 workspace=job.workspace,
                 max_attempts=max_attempts,
+                timeout_seconds=timeout_seconds,
                 validation_commands=validation_commands,
+                adaptive_strategy_ordering=bool(
+                    job.payload.get("adaptive_strategy_ordering", True)
+                ),
+                enable_verification_cache=bool(
+                    job.payload.get("enable_verification_cache", True)
+                ),
             )
-            report = agent.heal(
-                command=command,
-                workspace=job.workspace,
-                validation_commands=validation_commands,
+            report = _run_with_heartbeat(
+                app=app,
+                job_id=job_id,
+                hook_label="Self-heal in progress",
+                run_callable=lambda: agent.heal(
+                    command=command,
+                    workspace=job.workspace,
+                    validation_commands=validation_commands,
+                ),
             )
 
         if _is_job_cancel_requested(app, job_id):
@@ -2934,6 +4616,20 @@ def _render_ui(*, default_workspace: Path, provider: str, selected_workspace: Pa
           <textarea id="requirement" required placeholder="Implement a targeted feature in this project."></textarea>
           <label for="codebase-summary">Codebase Summary (optional override)</label>
           <textarea id="codebase-summary" placeholder="Leave empty to auto-generate summary."></textarea>
+          <div class="inline-row">
+            <div>
+              <label for="feature-codex-timeout">Codex Timeout (seconds)</label>
+              <input id="feature-codex-timeout" type="number" min="15" max="600" value="120" />
+            </div>
+            <div>
+              <label for="feature-gemini-timeout">Gemini Timeout (seconds)</label>
+              <input id="feature-gemini-timeout" type="number" min="15" max="600" value="120" />
+            </div>
+            <div>
+              <label for="feature-full-capability-mode">Full Capability (No Checks)</label>
+              <input id="feature-full-capability-mode" type="checkbox" />
+            </div>
+          </div>
           <button type="submit">Run Feature Job</button>
         </form>
       </article>
@@ -2958,6 +4654,28 @@ def _render_ui(*, default_workspace: Path, provider: str, selected_workspace: Pa
               <textarea id="program-summary" placeholder="Leave empty to auto-generate summary each phase."></textarea>
             </div>
           </div>
+          <div class="inline-row">
+            <div>
+              <label for="program-fast-mode">Fast Mode (recommended)</label>
+              <input id="program-fast-mode" type="checkbox" checked />
+            </div>
+            <div>
+              <label for="program-code-first-mode">Code-First Mode (recommended)</label>
+              <input id="program-code-first-mode" type="checkbox" />
+            </div>
+            <div>
+              <label for="program-full-capability-mode">Full Capability (No Checks)</label>
+              <input id="program-full-capability-mode" type="checkbox" />
+            </div>
+            <div>
+              <label for="program-codex-timeout">Codex Timeout (seconds)</label>
+              <input id="program-codex-timeout" type="number" min="15" max="600" value="120" />
+            </div>
+            <div>
+              <label for="program-gemini-timeout">Gemini Timeout (seconds)</label>
+              <input id="program-gemini-timeout" type="number" min="15" max="600" value="120" />
+            </div>
+          </div>
           <button type="submit">Run Program Job</button>
         </form>
       </article>
@@ -2980,6 +4698,14 @@ def _render_ui(*, default_workspace: Path, provider: str, selected_workspace: Pa
           <div class="kpi">
             <span class="kpi-label">Completion Time</span>
             <span class="kpi-value" id="completion-time">-</span>
+          </div>
+          <div class="kpi">
+            <span class="kpi-label">Avg Phase Time</span>
+            <span class="kpi-value" id="avg-phase-time">-</span>
+          </div>
+          <div class="kpi">
+            <span class="kpi-label">Avg Subtask Time</span>
+            <span class="kpi-value" id="avg-subtask-time">-</span>
           </div>
         </div>
         <div class="progress-wrap"><div id="progress-fill" class="progress-fill"></div></div>
@@ -3054,6 +4780,8 @@ def _render_ui(*, default_workspace: Path, provider: str, selected_workspace: Pa
     const completionRateLabel = document.getElementById("completion-rate");
     const activeStatusLabel = document.getElementById("active-status");
     const completionTimeLabel = document.getElementById("completion-time");
+    const avgPhaseTimeLabel = document.getElementById("avg-phase-time");
+    const avgSubtaskTimeLabel = document.getElementById("avg-subtask-time");
     const progressFill = document.getElementById("progress-fill");
     const nextHookLabel = document.getElementById("next-hook");
     const hookList = document.getElementById("hook-list");
@@ -3270,6 +4998,8 @@ def _render_ui(*, default_workspace: Path, provider: str, selected_workspace: Pa
         completionRateLabel.textContent = "0%";
         activeStatusLabel.textContent = "idle";
         completionTimeLabel.textContent = "-";
+        avgPhaseTimeLabel.textContent = "-";
+        avgSubtaskTimeLabel.textContent = "-";
         progressFill.style.width = "0%";
         nextHookLabel.textContent = "Next: waiting for first job.";
         hookList.innerHTML = "<li>No hooks yet.</li>";
@@ -3282,11 +5012,17 @@ def _render_ui(*, default_workspace: Path, provider: str, selected_workspace: Pa
 
       state.selectedJob = job;
       const progress = job.progress || {};
+      const result = job.result || {};
+      const benchmarks = result && typeof result === "object" ? (result.benchmarks || {}) : {};
       const percent = Number(progress.percent || 0);
       activeJobLabel.textContent = `${job.job_type} (${truncate(job.job_id, 12)})`;
       completionRateLabel.textContent = `${percent}%`;
       activeStatusLabel.textContent = job.status;
       completionTimeLabel.textContent = formatDuration(job.started_at, job.finished_at);
+      const avgPhaseSeconds = Number(benchmarks.average_phase_duration_seconds || 0);
+      const avgSubtaskSeconds = Number(benchmarks.average_subtask_duration_seconds || 0);
+      avgPhaseTimeLabel.textContent = avgPhaseSeconds > 0 ? `${avgPhaseSeconds}s` : "-";
+      avgSubtaskTimeLabel.textContent = avgSubtaskSeconds > 0 ? `${avgSubtaskSeconds}s` : "-";
       progressFill.style.width = `${Math.max(0, Math.min(100, percent))}%`;
       nextHookLabel.textContent = `Next: ${progress.next_hook || "Done"}`;
       renderHookList(job);
@@ -3450,10 +5186,16 @@ def _render_ui(*, default_workspace: Path, provider: str, selected_workspace: Pa
       const requirement = document.getElementById("requirement").value.trim();
       if (!requirement) return;
       const codebaseSummary = document.getElementById("codebase-summary").value.trim();
+      const codexTimeoutSeconds = Number(document.getElementById("feature-codex-timeout").value || "120");
+      const geminiTimeoutSeconds = Number(document.getElementById("feature-gemini-timeout").value || "120");
+      const fullCapabilityMode = document.getElementById("feature-full-capability-mode").checked;
       const payload = {
         requirement,
         workspace: state.selectedWorkspace,
         codebase_summary: codebaseSummary || null,
+        codex_timeout_seconds: codexTimeoutSeconds,
+        gemini_timeout_seconds: geminiTimeoutSeconds,
+        full_capability_mode: fullCapabilityMode,
       };
       const result = await api("/api/execute", {
         method: "POST",
@@ -3473,12 +5215,22 @@ def _render_ui(*, default_workspace: Path, provider: str, selected_workspace: Pa
       const codebaseSummary = document.getElementById("program-summary").value.trim();
       const maxPhases = Number(document.getElementById("program-max-phases").value || "6");
       const maxSubtasksPerPhase = Number(document.getElementById("program-max-subtasks").value || "6");
+      const fastMode = document.getElementById("program-fast-mode").checked;
+      const codeFirstMode = document.getElementById("program-code-first-mode").checked;
+      const fullCapabilityMode = document.getElementById("program-full-capability-mode").checked;
+      const codexTimeoutSeconds = Number(document.getElementById("program-codex-timeout").value || "120");
+      const geminiTimeoutSeconds = Number(document.getElementById("program-gemini-timeout").value || "120");
       const payload = {
         requirement,
         workspace: state.selectedWorkspace,
         codebase_summary: codebaseSummary || null,
         max_phases: maxPhases,
         max_subtasks_per_phase: maxSubtasksPerPhase,
+        fast_mode: fastMode,
+        code_first_mode: codeFirstMode,
+        full_capability_mode: fullCapabilityMode,
+        codex_timeout_seconds: codexTimeoutSeconds,
+        gemini_timeout_seconds: geminiTimeoutSeconds,
       };
       const result = await api("/api/execute-program", {
         method: "POST",
@@ -3807,6 +5559,9 @@ def create_app(
             payload={
                 "requirement": requirement,
                 "codebase_summary": (payload.codebase_summary or "").strip(),
+                "codex_timeout_seconds": payload.codex_timeout_seconds,
+                "gemini_timeout_seconds": payload.gemini_timeout_seconds,
+                "full_capability_mode": payload.full_capability_mode,
             },
             created_at=created_at,
         )
@@ -3849,6 +5604,11 @@ def create_app(
                 "codebase_summary": (payload.codebase_summary or "").strip(),
                 "max_phases": payload.max_phases,
                 "max_subtasks_per_phase": payload.max_subtasks_per_phase,
+                "fast_mode": payload.fast_mode,
+                "code_first_mode": payload.code_first_mode,
+                "full_capability_mode": payload.full_capability_mode,
+                "codex_timeout_seconds": payload.codex_timeout_seconds,
+                "gemini_timeout_seconds": payload.gemini_timeout_seconds,
             },
             created_at=created_at,
         )
@@ -3904,6 +5664,9 @@ def create_app(
                 "command": command,
                 "max_attempts": payload.max_attempts,
                 "validation_commands": validation_commands or None,
+                "timeout_seconds": payload.timeout_seconds,
+                "adaptive_strategy_ordering": payload.adaptive_strategy_ordering,
+                "enable_verification_cache": payload.enable_verification_cache,
             },
             created_at=created_at,
         )

@@ -4,7 +4,7 @@ import json
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import ClassVar, Iterable
 
 from senior_agent.llm_client import LLMClient
 from senior_agent.models import ImplementationPlan
@@ -14,6 +14,9 @@ from senior_agent.patterns import CODE_FENCE_PATTERN
 @dataclass
 class TestWriter:
     """Generate test files for newly planned source files."""
+
+    # Prevent pytest from misclassifying this dataclass as a test container.
+    __test__: ClassVar[bool] = False
 
     llm_client: LLMClient
     workspace: str | Path = "."

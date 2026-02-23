@@ -1,0 +1,44 @@
+{
+  "error_taxonomy": {
+    "ContractMismatch": "Implementation deviates from node intent.",
+    "ValidationFailure": "Validation command failed."
+  },
+  "examples": [
+    {
+      "node_id": "html_scaffold",
+      "steps": [
+        "Create index.html with a main container and a display read-out area.",
+        "Add a grid container for the calculator buttons."
+      ],
+      "target_files": [
+        "index.html"
+      ]
+    }
+  ],
+  "inputs": [
+    {
+      "name": "depends_on",
+      "type": "contract_ui_layout"
+    },
+    {
+      "name": "shared_resources",
+      "type": "index.html"
+    }
+  ],
+  "invariants": [
+    "Modify only files listed in node new_files/modified_files.",
+    "Preserve dependency expectations from upstream nodes.",
+    "Implementation must follow the declared node steps."
+  ],
+  "node_id": "html_scaffold",
+  "outputs": [
+    {
+      "name": "new_file",
+      "type": "index.html"
+    }
+  ],
+  "public_api": [
+    "No explicit validation command declared."
+  ],
+  "purpose": "Build the base HTML document and calculator container."
+}

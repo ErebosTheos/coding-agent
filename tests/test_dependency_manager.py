@@ -1,4 +1,5 @@
 import sys
+import shlex
 import tempfile
 import unittest
 from dataclasses import dataclass, field
@@ -28,7 +29,7 @@ class DependencyManagerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             workspace = Path(tmp_dir)
             (workspace / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
-            pip_command = f"{sys.executable} -m pip install requests"
+            pip_command = f"{shlex.quote(sys.executable)} -m pip install requests"
             executor = ScriptedExecutor(
                 command_results={
                     pip_command: [

@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Senior Agent Dashboard</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --panel: #111827;
+      --panel-muted: #1f2937;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --success: #16a34a;
+      --failed: #dc2626;
+      --pending: #f59e0b;
+      --running: #0ea5e9;
+      --border: #374151;
+      --mono: "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+      color: var(--text);
+      background: radial-gradient(circle at 15% 10%, #1d4ed8 0%, var(--bg) 45%);
+      min-height: 100vh;
+    }
+    .wrap {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 24px;
+      display: grid;
+      gap: 16px;
+    }
+    .card {
+      background: color-mix(in oklab, var(--panel) 92%, black 8%);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+    }
+    .title { font-size: 1.4rem; margin: 0 0 8px; }
+    .meta { color: var(--muted); font-size: 0.95rem; margin: 0; }
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+      margin-top: 12px;
+    }
+    .pill {
+      background: var(--panel-muted);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+    }
+    .pill .k { color: var(--muted); display: block; font-size: 0.85rem; }
+    .pill .v { font-weight: 600; margin-top: 4px; display: block; }
+    .status-success { color: var(--success); }
+    .status-failed, .status-evicted { color: var(--failed); }
+    .status-pending { color: var(--pending); }
+    .status-running { color: var(--running); }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 8px;
+      font-size: 0.94rem;
+    }
+    th, td {
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+      padding: 8px;
+      vertical-align: top;
+    }
+    th { color: var(--muted); font-weight: 600; }
+    code, pre { font-family: var(--mono); font-size: 0.88rem; }
+    pre {
+      white-space: pre-wrap;
+      background: var(--panel-muted);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px;
+      margin: 0;
+      max-height: 240px;
+      overflow: auto;
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="card">
+      <h1 class="title" id="feature-name">Senior Agent Dashboard</h1>
+      <p class="meta" id="summary-text"></p>
+      <div class="stats">
+        <div class="pill"><span class="k">Stage</span><span class="v" id="stage-text"></span></div>
+        <div class="pill"><span class="k">Outcome</span><span class="v" id="outcome-text"></span></div>
+        <div class="pill"><span class="k">Updated</span><span class="v" id="updated-text"></span></div>
+        <div class="pill"><span class="k">Parallel Gain</span><span class="v" id="parallel-gain">n/a</span></div>
+      </div>
+    </section>
+    <section class="card">
+      <h2 class="title">Execution Grid</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Node</th>
+            <th>Status</th>
+            <th>Trace</th>
+            <th>Duration(s)</th>
+            <th>Dependencies</th>
+            <th>Note</th>
+          </tr>
+        </thead>
+        <tbody id="node-body"></tbody>
+      </table>
+    </section>
+    <section class="card">
+      <h2 class="title">Final Result</h2>
+      <pre id="final-result"></pre>
+    </section>
+  </main>
+  <script>
+    const sourcePath = "simple_counter_web_app.dashboard.json";
+    let payload = {"version": 1, "updated_at": "2026-02-23T20:27:40.611118+00:00", "stage": "final", "feature_name": "Simple Counter Web App", "summary": "Implementation of the web frontend and the Python server script.", "success": true, "blocked_reason": null, "final_result": {"command": "phase6_global_validation", "return_code": 0, "stdout": "All phases completed successfully.", "stderr": ""}, "telemetry": {"total_node_seconds": 48.75454479199834, "wall_clock_seconds": 65.72346529198694, "parallel_gain": 1.0, "initial_concurrency": 8, "final_concurrency": 8, "adaptive_throttle_events": 0, "level1_pass_nodes": 2, "level1_failed_nodes": 0, "level2_failures": 0}, "validation_commands": ["ls -la index.html main.py"], "nodes": [{"node_id": "frontend_implementation", "title": "Create Index Page", "summary": "Develop index.html containing the UI structure, counter logic, and basic styling.", "contract_node": false, "depends_on": [], "status": "success", "trace_id": "frontend_implementation-f0a4c6d6", "duration_seconds": 26.453471125016222, "note": "Node passed RED/GREEN and audit gates.", "commands_run": ["generate:index.html", "grep -q 'id=\"counter\"' index.html", "grep -q 'addEventListener' index.html"], "trace_log_path": null}, {"node_id": "server_implementation", "title": "Create Server Script", "summary": "Implement main.py using Python's http.server to serve the current directory on port 8080.", "contract_node": false, "depends_on": ["frontend_implementation"], "status": "success", "trace_id": "server_implementation-0c5b278d", "duration_seconds": 22.30107366698212, "note": "Node passed RED/GREEN and audit gates.", "commands_run": ["generate:main.py", "grep '8080' main.py", "python3 -m py_compile main.py"], "trace_log_path": null}]};
+
+    function safe(value) {
+      if (value === null || value === undefined) return "";
+      return String(value);
+    }
+    function statusClass(status) {
+      return `status-${safe(status).toLowerCase()}`;
+    }
+    function render(data) {
+      payload = data || payload;
+      if (!payload) return;
+      document.getElementById("feature-name").textContent = safe(payload.feature_name || "Senior Agent Dashboard");
+      document.getElementById("summary-text").textContent = safe(payload.summary || "");
+      document.getElementById("stage-text").textContent = safe(payload.stage || "unknown");
+      const outcomeLabel = payload.success ? "SUCCESS" : "IN PROGRESS / FAILED";
+      const outcomeEl = document.getElementById("outcome-text");
+      outcomeEl.textContent = outcomeLabel;
+      outcomeEl.className = `v ${payload.success ? "status-success" : "status-pending"}`;
+      document.getElementById("updated-text").textContent = safe(payload.updated_at || "");
+      const gain = payload.telemetry && payload.telemetry.parallel_gain;
+      document.getElementById("parallel-gain").textContent = gain === undefined || gain === null ? "n/a" : Number(gain).toFixed(2);
+
+      const body = document.getElementById("node-body");
+      body.textContent = "";
+      const nodes = Array.isArray(payload.nodes) ? payload.nodes : [];
+      for (const node of nodes) {
+        const row = document.createElement("tr");
+        const nameCell = document.createElement("td");
+        nameCell.innerHTML = `<strong>${safe(node.node_id)}</strong><br><span>${safe(node.title || "")}</span>`;
+        row.appendChild(nameCell);
+
+        const statusCell = document.createElement("td");
+        statusCell.textContent = safe(node.status || "pending");
+        statusCell.className = statusClass(node.status || "pending");
+        row.appendChild(statusCell);
+
+        const traceCell = document.createElement("td");
+        if (node.trace_log_path) {
+          const link = document.createElement("code");
+          link.textContent = safe(node.trace_log_path);
+          traceCell.appendChild(link);
+        } else {
+          traceCell.textContent = "n/a";
+        }
+        row.appendChild(traceCell);
+
+        const durationCell = document.createElement("td");
+        durationCell.textContent = Number(node.duration_seconds || 0).toFixed(2);
+        row.appendChild(durationCell);
+
+        const depsCell = document.createElement("td");
+        depsCell.textContent = (node.depends_on || []).join(", ") || "-";
+        row.appendChild(depsCell);
+
+        const noteCell = document.createElement("td");
+        noteCell.textContent = safe(node.note || "");
+        row.appendChild(noteCell);
+
+        body.appendChild(row);
+      }
+
+      document.getElementById("final-result").textContent = JSON.stringify(payload.final_result || {}, null, 2);
+    }
+
+    async function refresh() {
+      if (!sourcePath) return;
+      try {
+        const response = await fetch(`${sourcePath}?_=${Date.now()}`, { cache: "no-store" });
+        if (!response.ok) return;
+        const latest = await response.json();
+        render(latest);
+      } catch (_) {}
+    }
+
+    render(payload);
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>

@@ -2,11 +2,18 @@ from senior_agent._llm_client_impl import (
     CodexCLIClient,
     CommandExecutionResult,
     CommandRunner,
+    DEFAULT_TRANSPORT_SAFETY_PROMPT,
+    DEFAULT_TRANSPORT_SYSTEM_PROMPT,
     GeminiCLIClient,
+    LocalOffloadClient,
     LLMClient,
     LLMClientError,
     LLMRateLimitError,
     LLMTimeoutError,
+    MultiCloudRouter,
+    SpeculativeResponseParser,
+    build_transport_prompt,
+    parse_streamed_response,
 )
 
 __all__ = [
@@ -16,6 +23,13 @@ __all__ = [
     "LLMRateLimitError",
     "CommandExecutionResult",
     "CommandRunner",
+    "DEFAULT_TRANSPORT_SYSTEM_PROMPT",
+    "DEFAULT_TRANSPORT_SAFETY_PROMPT",
+    "build_transport_prompt",
+    "SpeculativeResponseParser",
+    "parse_streamed_response",
     "CodexCLIClient",
     "GeminiCLIClient",
+    "LocalOffloadClient",
+    "MultiCloudRouter",
 ]
