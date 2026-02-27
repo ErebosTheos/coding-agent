@@ -1,41 +1,12 @@
-# Python bytecode and caches
-__pycache__/
-*.py[cod]
-*$py.class
-
-# Virtual environments
+.env
 .venv/
-venv/
-env/
-ENV/
-
-# Test and type-check caches
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.pyre/
-.hypothesis/
-
-# Coverage and test artifacts
-.coverage
-.coverage.*
-htmlcov/
-
-
-# Packaging/build artifacts
-build/
-dist/
-.eggs/
+__pycache__/
+*.pyc
+*.pyo
 *.egg-info/
-pip-wheel-metadata/
-
-# IDE/editor files
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS files
-.DS_Store
-Projects/
-Thumbs.db
+dist/
+build/
+.pytest_cache/
+benchmark_output/
+test_output/
+Legacy*/
