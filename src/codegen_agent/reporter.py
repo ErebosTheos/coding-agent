@@ -1,7 +1,9 @@
+import dataclasses
 import json
 import os
 from enum import Enum
 from .models import PipelineReport
+from .run_log import make_run_summary, append_run_summary
 
 class Reporter:
     def __init__(self, workspace: str):
@@ -81,6 +83,13 @@ class Reporter:
 
         with open(os.path.join(self.report_dir, "pipeline_report.json"), 'w') as f:
             json.dump(report.to_dict(), f, indent=2, default=_default)
+
+        # Save per-stage trace log (append mode — one JSONL line per stage per run)
+        if report.stage_traces:
+            traces_path = os.path.join(self.report_dir, "traces.jsonl")
+            with open(traces_path, "a") as f:
+                for trace in report.stage_traces:
+                    f.write(json.dumps(dataclasses.asdict(trace)) + "\n")
             
         # Save Mermaid diagram
         mermaid = self.generate_mermaid(report)
@@ -91,3 +100,7 @@ class Reporter:
         summary = self.generate_summary(report)
         with open(os.path.join(self.report_dir, "report_summary.md"), 'w') as f:
             f.write(summary)
+
+        # Append one-line run summary for rolling-window metrics
+        run_summary = make_run_summary(report)
+        append_run_summary(os.path.join(self.report_dir, "runs.jsonl"), run_summary)

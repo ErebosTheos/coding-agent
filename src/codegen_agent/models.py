@@ -136,6 +136,22 @@ class VisualAuditResult:
         return asdict(self)
 
 @dataclass(frozen=True)
+class StageTrace:
+    stage: str
+    provider: str
+    model: Optional[str]
+    start_monotonic: float
+    end_monotonic: float
+    duration_seconds: float
+    start_unix_ts: float
+    end_unix_ts: float
+    prompt_chars: int
+    response_chars: int
+    retries: int = 0
+    fallback_used: bool = False
+    fallback_reason: Optional[str] = None
+
+@dataclass(frozen=True)
 class PipelineReport:
     prompt: str
     plan: Optional[Plan] = None
@@ -147,6 +163,7 @@ class PipelineReport:
     qa_report: Optional[QAReport] = None
     visual_audit: Optional[VisualAuditResult] = None
     wall_clock_seconds: float = 0.0
+    stage_traces: List["StageTrace"] = field(default_factory=list)
 
     def to_dict(self):
         return asdict(self)

@@ -1,13 +1,17 @@
 import json
 import os
+import asyncio
+import random
 from pathlib import Path
 from typing import Dict, Any, Optional
-from .protocol import LLMClient
+from .protocol import LLMClient, LLMTimeoutError, LLMError
 from .gemini_cli import GeminiCLIClient
 from .claude_cli import ClaudeCLIClient
 from .anthropic_api import AnthropicAPIClient
 from .openai_api import OpenAIClient
 from .codex_cli import CodexCLIClient
+from .cache import LLMCache
+from .caching_client import CachingLLMClient
 
 try:
     import yaml
@@ -62,6 +66,68 @@ def _load_dotenv(path: str = ".env") -> Dict[str, str]:
         value = value.strip().strip('"').strip("'")
         env[key] = value
     return env
+
+
+class _RetryingLLMClient:
+    """Wraps any LLMClient with transient-error retry and role fallback.
+
+    Retry policy (same as execute_with_retry):
+    - Up to max_retries retries for LLMTimeoutError and empty-output LLMError.
+    - Jittered exponential backoff between retries.
+    - One fallback attempt after primary retries are exhausted.
+    - astream() is passed through without retry (streams are not idempotent).
+    """
+
+    def __init__(
+        self,
+        primary: LLMClient,
+        role: str,
+        fallback: Optional[LLMClient] = None,
+        max_retries: int = 2,
+    ):
+        self._primary = primary
+        self._role = role
+        self._fallback = fallback
+        self._max_retries = max_retries
+
+    async def generate(self, prompt: str, system_prompt: str = "") -> str:
+        last_exc: Optional[Exception] = None
+
+        for attempt in range(self._max_retries + 1):
+            try:
+                response = await self._primary.generate(prompt, system_prompt=system_prompt)
+                if not response or not response.strip():
+                    raise LLMError(f"Empty response from role '{self._role}' on attempt {attempt + 1}")
+                return response
+            except LLMTimeoutError as exc:
+                last_exc = exc
+                if attempt < self._max_retries:
+                    delay = (2 ** attempt) * 0.5 + random.uniform(0, 0.5)
+                    await asyncio.sleep(delay)
+            except LLMError as exc:
+                last_exc = exc
+                is_empty = "empty response" in str(exc).lower()
+                if is_empty and attempt < self._max_retries:
+                    delay = (2 ** attempt) * 0.5 + random.uniform(0, 0.5)
+                    await asyncio.sleep(delay)
+                else:
+                    break
+
+        if self._fallback is not None:
+            try:
+                response = await self._fallback.generate(prompt, system_prompt=system_prompt)
+                if response and response.strip():
+                    return response
+            except Exception:
+                pass
+
+        raise LLMError(
+            f"Role '{self._role}' failed after {self._max_retries} retries: {last_exc}"
+        ) from last_exc
+
+    async def astream(self, prompt: str, system_prompt: str = ""):
+        async for chunk in self._primary.astream(prompt, system_prompt=system_prompt):
+            yield chunk
 
 
 class LLMRouter:
@@ -119,9 +185,22 @@ class LLMRouter:
         provider = role_config.get("provider", "gemini_cli")
         model = role_config.get("model")
 
-        client_key = f"{provider}:{model}"
+        use_cache = os.environ.get("CODEGEN_CACHE", "").strip() == "1"
+        client_key = f"{role}:{provider}:{model}:{'c' if use_cache else 'r'}"
+
         if client_key not in self._clients:
-            self._clients[client_key] = self._create_client(provider, model)
+            raw = self._create_client(provider, model)
+            if use_cache:
+                cache_dir = os.path.join(".codegen_agent", "llm_cache")
+                cache = LLMCache(cache_dir)
+                client: LLMClient = CachingLLMClient(raw, cache, provider, model)
+            else:
+                client = raw
+            if not isinstance(client, _RetryingLLMClient):
+                fallback = self._get_fallback_client(role)
+                client = _RetryingLLMClient(client, role, fallback=fallback)
+            self._clients[client_key] = client
+
         return self._clients[client_key]
 
     def _create_client(self, provider: str, model: Optional[str]) -> LLMClient:
@@ -139,3 +218,24 @@ class LLMRouter:
             f"Unknown provider '{provider}'. "
             f"Valid options: claude, gemini, openai/codex, claude_cli, gemini_cli"
         )
+
+    def _get_fallback_client(self, role: str) -> Optional[LLMClient]:
+        env_prov = f"CODEGEN_{role.upper()}_FALLBACK_PROVIDER"
+        env_model = f"CODEGEN_{role.upper()}_FALLBACK_MODEL"
+        prov_raw = os.environ.get(env_prov, "").lower()
+        if not prov_raw:
+            return None
+        provider = _PROVIDER_ALIASES.get(prov_raw, prov_raw)
+        model = os.environ.get(env_model) or _DEFAULT_MODELS.get(provider)
+        return self._create_client(provider, model)
+
+    async def execute_with_retry(
+        self,
+        role: str,
+        prompt: str,
+        system_prompt: str = "",
+    ) -> tuple[str, int, bool, Optional[str]]:
+        """Backward-compatible wrapper — retry is now handled by _RetryingLLMClient."""
+        client = self.get_client_for_role(role)
+        response = await client.generate(prompt, system_prompt=system_prompt)
+        return response, 0, False, None

@@ -10,13 +10,11 @@ Timeline (8-file project, Gemini ~30s generation, ~15s per node):
                → total ≈ 35-45s instead of 60s
 """
 
-import asyncio
 import json
+import os
 from typing import Optional
 
-from .models import (
-    Architecture, Contract, ExecutionNode, ExecutionResult, GeneratedFile, Plan,
-)
+from .models import Architecture, Plan
 from .executor import Executor
 from .planner_architect import COMBINED_SYSTEM_PROMPT, COMBINED_USER_PROMPT, PlannerArchitect
 from .utils import find_json_in_text, extract_code_from_markdown
@@ -138,8 +136,9 @@ class StreamingPlanArchExecutor:
     """Overlaps the Plan+Architect LLM stream with individual file generation.
 
     As the LLM streams its JSON response, each parsed node is immediately
-    dispatched as an asyncio Task via ``Executor._execute_node``.  Dependency
-    ordering is respected: a node waits for its dep Tasks before executing.
+    dispatched as an asyncio Task via ``Executor._execute_node``.
+    By default, dependency gating is disabled to maximize parallel throughput.
+    Set ``CODEGEN_STREAM_RESPECT_DEPENDENCIES=1`` to restore strict dep waits.
     The full buffered response is parsed at the end to extract the canonical
     ``Plan`` and ``Architecture`` objects.
 
@@ -150,6 +149,9 @@ class StreamingPlanArchExecutor:
     def __init__(self, llm_client: LLMClient, executor: Executor) -> None:
         self.llm_client = llm_client
         self.executor = executor
+        self._respect_dependencies = (
+            os.environ.get("CODEGEN_STREAM_RESPECT_DEPENDENCIES", "0").strip() == "1"
+        )
 
     async def run(self, prompt: str) -> tuple[Plan, Architecture, ExecutionResult]:
         # If the client doesn't support streaming, fall back immediately.
@@ -159,108 +161,18 @@ class StreamingPlanArchExecutor:
             exec_result = await self.executor.execute(architecture)
             return plan, architecture, exec_result
 
+        # ── Phase 1: Stream Plan + Architecture ─────────────────────────────
+        # Buffer the full response; parse plan+arch once the stream is done.
+        # No per-node dispatch here — all execution happens in Phase 2 so the
+        # LLM sees the complete file tree as context (avoids cross-file mismatches).
         full_buf = ""
-        node_parser = _NodeParser()
-
-        # node_id → Task[GeneratedFile]
-        dispatched: dict[str, asyncio.Task] = {}
-        # raw node dicts waiting for their dependencies to be dispatched
-        pending_raw: list[dict] = []
-        # ordered list of dispatched ExecutionNode objects (for partial arch context)
-        seen_nodes: list[ExecutionNode] = []
-
-        # Reuse the executor's concurrency limit so we never spawn more concurrent
-        # LLM subprocesses than the executor would for a normal wave-based run.
-        # Dep-waiting does NOT hold the semaphore — only the actual LLM call does.
-        semaphore = asyncio.Semaphore(self.executor.concurrency)
-
-        def _parse_node(nd: dict) -> ExecutionNode:
-            contract_data = nd.get("contract")
-            contract = Contract(**contract_data) if isinstance(contract_data, dict) else None
-            return ExecutionNode(
-                node_id=nd["node_id"],
-                file_path=nd["file_path"],
-                purpose=nd["purpose"],
-                depends_on=nd.get("depends_on", []),
-                contract=contract,
-            )
-
-        def _dispatch(node: ExecutionNode) -> None:
-            """Create a Task for a node, waiting for its dependency Tasks first."""
-            seen_nodes.append(node)
-            # Snapshot the partial architecture at dispatch time.
-            # _execute_node only needs file_tree (prompt context) and nodes
-            # (dep file-path lookup) — both are available for dispatched nodes.
-            partial_arch = Architecture(
-                file_tree=[n.file_path for n in seen_nodes],
-                nodes=list(seen_nodes),
-                global_validation_commands=[],
-            )
-            dep_tasks = [dispatched[dep] for dep in node.depends_on if dep in dispatched]
-
-            async def _run() -> GeneratedFile:
-                # Await deps outside the semaphore so waiting nodes don't block slots
-                if dep_tasks:
-                    await asyncio.gather(*dep_tasks, return_exceptions=True)
-                async with semaphore:
-                    return await self.executor._execute_node(node, partial_arch)
-
-            dispatched[node.node_id] = asyncio.create_task(_run())
-
-        def _flush_pending() -> None:
-            """Dispatch any pending nodes whose dependencies are now dispatched."""
-            changed = True
-            while changed and pending_raw:
-                changed = False
-                still: list[dict] = []
-                for nd in list(pending_raw):
-                    node = _parse_node(nd)
-                    if all(dep in dispatched for dep in node.depends_on):
-                        _dispatch(node)
-                        changed = True
-                    else:
-                        still.append(nd)
-                pending_raw[:] = still
-
-        # ── Stream the LLM response ─────────────────────────────────────────
         print("  [StreamExecutor] Streaming Plan+Architect response...")
         async for chunk in self.llm_client.astream(
             COMBINED_USER_PROMPT.format(prompt=prompt),
             system_prompt=COMBINED_SYSTEM_PROMPT,
         ):
             full_buf += chunk
-            for nd in node_parser.feed(chunk):
-                node = _parse_node(nd)
-                if all(dep in dispatched for dep in node.depends_on):
-                    _dispatch(node)
-                else:
-                    pending_raw.append(nd)
-            if pending_raw:
-                _flush_pending()
 
-        # Final flush — handles any nodes not yet dispatched
-        _flush_pending()
-        # Force-dispatch nodes with unresolvable deps (broken architecture)
-        for nd in list(pending_raw):
-            _dispatch(_parse_node(nd))
-        pending_raw.clear()
-
-        print(
-            f"  [StreamExecutor] Stream complete. "
-            f"{len(dispatched)} node task(s) dispatched; awaiting..."
-        )
-
-        # ── Await all node Tasks ────────────────────────────────────────────
-        generated_files: list[GeneratedFile] = []
-        failed_nodes: list[str] = []
-        for node_id, task in dispatched.items():
-            try:
-                generated_files.append(await task)
-            except Exception as exc:
-                print(f"  [StreamExecutor] Node {node_id} failed: {exc}")
-                failed_nodes.append(node_id)
-
-        # ── Parse Plan + Architecture from the full buffered response ───────
         json_blocks = extract_code_from_markdown(full_buf, "json")
         try:
             data = (
@@ -276,7 +188,14 @@ class StreamingPlanArchExecutor:
         plan = PlannerArchitect._parse_plan(data.get("plan", data))
         architecture = PlannerArchitect._parse_architecture(data.get("architecture", data))
 
-        return plan, architecture, ExecutionResult(
-            generated_files=generated_files,
-            failed_nodes=failed_nodes,
+        print(
+            f"  [StreamExecutor] Plan+Arch complete. "
+            f"{len(architecture.nodes)} node(s). Executing (stream-bulk)..."
         )
+
+        # ── Phase 2: Stream-bulk execution ──────────────────────────────────
+        # One LLM call for all files; files written as their JSON values arrive.
+        # Falls back to wave-based if the stream produces incomplete JSON.
+        exec_result = await self.executor._stream_bulk(architecture)
+
+        return plan, architecture, exec_result

@@ -38,6 +38,7 @@ class ClaudeCLIClient(LLMClient):
         # Claude Code refuses to launch inside another Claude Code session unless
         # the CLAUDECODE env var is unset in the child process.
         env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+        timeout = int(os.environ.get("CODEGEN_LLM_TIMEOUT", "120"))
 
         try:
             process = await asyncio.create_subprocess_exec(
@@ -50,11 +51,11 @@ class ClaudeCLIClient(LLMClient):
             try:
                 stdout, stderr = await asyncio.wait_for(
                     process.communicate(),
-                    timeout=self.timeout_seconds,
+                    timeout=timeout,
                 )
             except asyncio.TimeoutError:
                 process.kill()
-                raise LLMTimeoutError(f"Claude CLI timed out after {self.timeout_seconds}s")
+                raise LLMTimeoutError(f"Claude CLI timed out after {timeout}s")
 
             stdout_str = stdout.decode().strip()
             stderr_str = stderr.decode().strip()

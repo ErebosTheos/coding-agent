@@ -88,3 +88,53 @@ def calculate_sha256(content: str) -> str:
 def ensure_directory(path: str):
     """Ensures that a directory exists."""
     os.makedirs(path, exist_ok=True)
+
+
+def prune_prompt(prompt: str, max_chars: int = 32_000) -> str:
+    """Reduce prompt length while preserving the highest-signal sections.
+
+    Strategy (§14.5):
+    1. Soft trim: replace <<SOURCE>> / <<FILE>> blocks with signature-only view.
+    2. Hard clear: drop <<HISTORY_START>> ... <<HISTORY_END>> blobs.
+    3. Preserve: <<LATEST_SOURCE>>, <<TEST_OUTPUT>>, <<CONTRACT>> always kept.
+       If still over limit, truncate from the start (preserve the tail).
+    """
+    if len(prompt) <= max_chars:
+        return prompt
+
+    # Step 1: soft trim — replace <<SOURCE>> block content with signatures
+    def _signatures_only(block_content: str) -> str:
+        lines = block_content.splitlines()
+        keep = []
+        for i, line in enumerate(lines):
+            stripped = line.lstrip()
+            if stripped.startswith(("def ", "async def ", "class ")):
+                keep.append(line)
+                # include next line if it looks like a docstring opener
+                if i + 1 < len(lines) and '"""' in lines[i + 1]:
+                    keep.append(lines[i + 1])
+        return "\n".join(keep) if keep else block_content[:200]
+
+    prompt = re.sub(
+        r"(<<(?:SOURCE|FILE)>>)(.*?)(<<\/(?:SOURCE|FILE)>>)",
+        lambda m: m.group(1) + _signatures_only(m.group(2)) + m.group(3),
+        prompt,
+        flags=re.DOTALL,
+    )
+
+    if len(prompt) <= max_chars:
+        return prompt
+
+    # Step 2: hard clear — drop history blobs
+    prompt = re.sub(
+        r"<<HISTORY_START>>.*?<<HISTORY_END>>",
+        "",
+        prompt,
+        flags=re.DOTALL,
+    )
+
+    if len(prompt) <= max_chars:
+        return prompt
+
+    # Step 3: truncate from start, keep the tail
+    return prompt[-max_chars:]

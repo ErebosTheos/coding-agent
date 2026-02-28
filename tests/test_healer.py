@@ -1,8 +1,10 @@
+import asyncio
 import os
 import tempfile
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from codegen_agent.healer import Healer
+from codegen_agent.models import CommandResult
 
 @pytest.fixture
 def temp_workspace():
@@ -90,3 +92,82 @@ def test_extract_target_file_can_edit_tests_when_enabled(temp_workspace):
 
     output = 'Error in File "tests/test_logic.py", line 1'
     assert permissive_healer._extract_target_file(output) == "tests/test_logic.py"
+
+
+def test_fix_single_failure_blocks_missing_tool(healer):
+    failure = CommandResult(
+        command="ruff check .",
+        exit_code=127,
+        stdout="",
+        stderr="/bin/sh: ruff: command not found",
+    )
+
+    result = asyncio.run(healer._fix_single_failure(failure, attempt_number=1))
+
+    assert isinstance(result, str)
+    assert "Missing tool 'ruff'" in result
+    healer.llm_client.generate.assert_not_called()
+
+
+def test_get_most_recent_file_ignores_pytest_cache(healer, temp_workspace):
+    src_file = os.path.join(temp_workspace, "main.py")
+    with open(src_file, "w") as f:
+        f.write("print('ok')\n")
+
+    cache_dir = os.path.join(temp_workspace, ".pytest_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_file = os.path.join(cache_dir, "README.md")
+    with open(cache_file, "w") as f:
+        f.write("cache")
+
+    os.utime(src_file, (100, 100))
+    os.utime(cache_file, (200, 200))
+
+    assert healer._get_most_recent_file() == "main.py"
+
+
+def test_fix_single_failure_bootstraps_conftest_for_missing_root_module(healer):
+    stack_file = os.path.join(healer.workspace, "stack.py")
+    with open(stack_file, "w") as f:
+        f.write("class Stack:\n    pass\n")
+
+    failure = CommandResult(
+        command="pytest tests/",
+        exit_code=2,
+        stdout="ModuleNotFoundError: No module named 'stack'",
+        stderr="",
+    )
+
+    result = asyncio.run(healer._fix_single_failure(failure, attempt_number=1))
+
+    assert result is not None
+    assert "conftest.py" in result.changed_files
+    conftest_path = os.path.join(healer.workspace, "conftest.py")
+    assert os.path.exists(conftest_path)
+    with open(conftest_path, "r") as f:
+        assert "ROOT = os.path.dirname" in f.read()
+    healer.llm_client.generate.assert_not_called()
+
+
+def test_fix_single_failure_applies_ruff_autofix_without_llm(healer):
+    failure = CommandResult(
+        command="ruff check .",
+        exit_code=1,
+        stdout="",
+        stderr="I001 Import block is un-sorted or un-formatted",
+    )
+    autofix = CommandResult(
+        command="ruff check --fix .",
+        exit_code=0,
+        stdout="",
+        stderr="",
+    )
+
+    with patch("codegen_agent.healer.run_shell_command", return_value=autofix) as mocked:
+        result = asyncio.run(healer._fix_single_failure(failure, attempt_number=1))
+
+    assert result is not None
+    assert result.failure_type.value == "LINT_TYPE_FAILURE"
+    assert "ruff check --fix ." in result.fix_applied
+    mocked.assert_called_once()
+    healer.llm_client.generate.assert_not_called()

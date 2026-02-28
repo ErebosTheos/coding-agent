@@ -41,6 +41,14 @@ Given a user request, return a single JSON object with exactly two keys: "plan" 
   // Include ALL commands needed (lint + test). These are run verbatim in the project root.
 }
 
+ARCHITECTURE RULES:
+- ALWAYS include a dependency manifest in file_tree and nodes: requirements.txt for Python,
+  package.json for Node, go.mod for Go, Cargo.toml for Rust, composer.json for PHP.
+- For web apps (FastAPI, Flask, Express, etc.) whose source lives inside src/, ALWAYS include
+  a top-level entry point file (run.py for Python, index.js for Node) in the file_tree and
+  nodes so users can start the server with `python run.py` or `node index.js`.
+- Do NOT create directory placeholder nodes (e.g. node_id for "src/"). Only list real files.
+
 Respond ONLY with the raw JSON object. No markdown fences, no commentary."""
 
 COMBINED_USER_PROMPT = """User Request: {prompt}

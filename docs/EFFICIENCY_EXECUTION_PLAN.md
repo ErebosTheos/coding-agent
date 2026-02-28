@@ -15,7 +15,7 @@ This document has one execution authority and separate archival commentary.
 
 - **Normative sections (source of truth):** `§1` through `§9`
 - **Implementation spec additions:** `§14` and `§15`
-- **Archival review commentary (non-normative):** `§10`, `§11`, `§12`, `§13`, `§16`
+- **Archival review commentary (non-normative):** `§10`, `§11`, `§12`, `§13`, `§16`, `§17`, `§18`, `§19`
 
 If any archival section conflicts with normative sections, follow normative sections.
 
@@ -73,7 +73,7 @@ Recommended starting point:
 - architect: `claude_cli` (better long-form structured design reliability)
 - executor: `codex_cli` (best tool-oriented code synthesis path in current setup)
 - tester: `gemini_cli`
-- healer: `claude_cli` or `codex_cli` (higher repair quality)
+- healer: `codex_cli` by default; switch to `claude_cli` if healer quality is red for two consecutive rolling windows
 - qa_auditor: `gemini_cli`
 
 `ollama` is a future optional lane and is not part of the default matrix until client/router support and benchmark validation are complete.
@@ -92,6 +92,12 @@ Cache storage:
 Avoid many small test commands by default.
 - Prefer one primary command (for example `pytest -q -x`) during heal loop.
 - Fall back to per-file commands only when targeted debugging is needed.
+
+### 3.5 `health` and `doctor` CLI commands
+Reduce setup friction and benchmark noise with fast diagnostics.
+- `codegen health`: fast read-only checks — CLI binaries present (`claude`, `gemini`, `codex`), `.env` loaded, provider mappings valid, workspace state clean.
+- `codegen doctor`: deep checks + optional repair suggestions — binary versions, auth/config validity, checkpoint integrity, stage trace schema compatibility.
+Run `codegen health` as the first step in every benchmark cycle.
 
 ## 4. Phase 2: Correctness Gates that Save Time
 Target: 2-3 days
@@ -126,8 +132,14 @@ Current threshold can be made smarter using:
 - historical JSON parse failure rate
 
 ### 5.3 Streaming improvements
-Keep streamed Plan+Architect+Execute path as default where provider supports it.  
+Keep streamed Plan+Architect+Execute path as default where provider supports it.
 Instrument stream parse failures and fallback frequency.
+
+### 5.4 Queue/lane concurrency guard
+Prevent run collisions and checkpoint races under multiple concurrent pipeline runs.
+- Per-workspace session lane lock — one active pipeline run per workspace directory.
+- Global max concurrent pipeline runs cap across all workspaces.
+- Fail fast with clear error when lock is held; do not silently queue and interleave writes.
 
 ## 6. Phase 4: Cost Efficiency
 Target: 2-4 days
@@ -150,17 +162,33 @@ On resume, skip re-generation for files already validated by checksum + stage me
 ## 7. Rollout Plan
 
 ### 7.1 Rollout order
-1. Benchmark suite + baseline gate  
-2. Heal/test command consolidation (`pytest -q -x` default path)  
-3. Per-stage telemetry  
-4. CLI routing defaults + prompt/response cache  
-5. Token minimization for executor/healer prompts  
-6. Budget-aware policies
+1. Benchmark suite + baseline gate
+2. Router retry/failover + prompt pruning — must precede throughput tuning or benchmarks will be noisy and unstable
+3. Heal/test command consolidation (`pytest -q -x` default path)
+4. Per-stage telemetry + `health`/`doctor` CLI
+5. CLI routing defaults + prompt/response cache
+6. Queue/lane concurrency guard
+7. Token minimization for executor/healer prompts
+8. Budget-aware policies
 
 ### 7.2 Safety checks per rollout step
 - Run `pytest -q` in repo root.
 - Run benchmark suite and compare against baseline.
-- Apply Green/Amber/Red policy from `§12` using rolling windows (`10-20` runs).
+- Apply Green/Amber/Red policy using rolling windows (`10-20` runs):
+  - Runtime improvement vs baseline:
+    - `Green`: `>=35%`
+    - `Amber`: `20% to <35%`
+    - `Red`: `<20%`
+  - First-pass success vs baseline:
+    - `Green`: `>=+20%`
+    - `Amber`: `+5% to <+20%`
+    - `Red`: more than `3%` below baseline
+  - Healing-attempt reduction vs baseline:
+    - `Green`: `>=30%`
+    - `Amber`: `15% to <30%`
+    - `Red`: `<15%`
+  - QA approval:
+    - `Red` if approval drops by more than `2%` from baseline
 - Allow isolated amber outcomes with mitigation notes.
 - Escalate on any red outcome or two consecutive amber windows for the same metric.
 
@@ -180,11 +208,15 @@ Use this as your instruction template skeleton.
 - [ ] Standardize heal loop to one primary validation command.
 - [ ] Enforce pre-heal source consistency checks.
 - [ ] Keep test-file edits disabled unless explicitly requested.
-- [ ] Implement retry-then-fallback logic per role (§14.3).
-- [ ] Implement prompt-size cap + automatic context reduction path (§14.5).
+- [ ] Implement retry-then-fallback logic per role (§14.3): transient-only, jittered backoff, role fallback chain.
+- [ ] Implement prompt-size cap + automatic context reduction path (§14.5): soft trim → hard clear → preserve key context.
+- [ ] Add `codegen health` and `codegen doctor` CLI commands (§3.5).
+- [ ] Add queue/lane concurrency guard — workspace-level lock + global pipeline cap (§5.4).
 - [ ] Add benchmark comparison gate in CI (or local release checklist).
 - [ ] Track P50/P90 runtime + first-pass success + healing attempts + token usage.
 - [ ] Accept release only when Success Criteria in Section 1 are met.
+- [ ] (Future) Skill gating metadata — gate CLI skills by runtime readiness before exposure.
+- [ ] (Future) Tool policy tiers — sandbox/elevated execution policy for risky tool usage.
 
 ## 9. Definition of Done
 This plan is complete when:
@@ -219,7 +251,7 @@ Phase 2 and Phase 3 are essentially complete. The plan is front-loaded with corr
 | Plan Item | Gap |
 |-----------|-----|
 | §2.1 Per-stage telemetry | Only `wall_clock_seconds` exists on `PipelineReport`. No per-stage timing, prompt sizes, provider/model used, or fallback counts. Need a `StageTrace` field. |
-| §3.2 CLI role matrix | Router supports role overrides via env vars. The role-to-CLI mapping in §3.2 is now documented in the plan but there is no default `.env` file committed and no validation run confirming quality parity. Configuration exists; defaults do not. |
+| §3.2 CLI role matrix | Router supports role overrides via env vars. `.env.example` committed (see §15.1). No benchmark validation run yet — quality parity still unconfirmed. |
 | §3.4 Heal command consolidation | `global_validation_commands` from the architect is used, but the healer still runs each command individually in a loop. No `pytest -q -x` fail-fast consolidation. Can still spawn 10+ separate pytest processes when one aggregate command would be faster. |
 | §6.3 Resume reuse | Checkpointing resumes from the last completed stage, not individual files. If executor fails halfway it re-runs the whole stage. The `sha256` on `GeneratedFile` is stored but never used for skip logic on resume. |
 
@@ -233,41 +265,12 @@ Phase 2 and Phase 3 are essentially complete. The plan is front-loaded with corr
 | §6.1 Budget-aware routing | Low | No per-stage retry or timeout budget beyond `max_attempts=3` in healer. CLI providers give no token-count feedback so this is limited to retry/timeout caps. |
 | §6.2 Token minimization outside tests | Low | `_extract_api_surface()` already exists in `test_writer.py` but is not reused in executor or healer prompts, which send full file content and full architecture context on every call. |
 
-### Notes on Codex Revisions
+### Resolved Since This Review
 
-**Operating Constraint added — good call.**
-Adding the explicit CLI-only constraint at the top removes ambiguity. All three providers (`claude_cli`, `gemini_cli`, `codex_cli`) are present in the router. This constraint requires no code change.
-
-**§3.2 rewrite is correct and actionable.**
-The new CLI role matrix (claude_cli for architect/healer/qa, codex_cli for executor, gemini_cli or ollama for tester/planner) is the right shape. The router already supports it via env vars. The only missing piece is a committed default `.env` template and at least one benchmark run validating the split produces better P50 than single-provider runs.
-
-**§5.1 framing update is accurate.**
-Changed from "API rate-limit prone" to "heavier CLI providers with higher startup latency." This is correct — CLI providers pay subprocess startup cost per call, so the concurrency cap logic should eventually differentiate by provider. The current uniform `cpu_count()` cap is a reasonable starting point but will need per-provider tuning once benchmark data exists.
-
-**§7.1 rollout order now matches recommended priority.**
-The updated rollout order (benchmark first, then heal consolidation, then telemetry, then routing + cache, then token minimization, then budget) is correct and aligns with the previous review recommendation. No disagreement.
-
-**Ollama is a new dependency — flag before committing.**
-The plan lists ollama as optional but the checklist explicitly says "Add optional ollama weak-model lane and validate quality impact." Before implementing this, confirm ollama is available in the target environment and define the quality bar it must meet to stay enabled for a given role. Do not enable it by default without a benchmark comparison.
-
-### Remaining Issues
-
-**§3.3 Cache key for executor role needs workspace hash.**
-Planner, tester, and qa_auditor can use `hash(role + provider + model + system_prompt + user_prompt)` as the cache key. The executor role also needs the project file-tree in the key — otherwise two different projects with the same prompt will get each other's generated files from cache.
-
-**§3.4 Heal consolidation is still the fastest remaining win.**
-One `pytest -q -x tests/` replaces N individual subprocess spawns. Small change, high ROI. Should be the first code change after the benchmark baseline is established.
-
-### Recommended Priority Order
-
-1. Benchmark suite — hard gate, nothing else can be measured without it
-2. Commit a default `.env` template with the CLI role matrix from §3.2
-3. Heal command consolidation (`pytest -q -x`) — high ROI, ~1 hour change
-4. Per-stage telemetry (`StageTrace` on `PipelineReport`) — needed to verify all gains
-5. Prompt/response cache — especially valuable for CLI due to subprocess startup cost
-6. Ollama client — optional weak-model lane, only after benchmark validates quality
-7. Token minimization in executor/healer — reuse `_extract_api_surface()` already written
-8. Budget-aware routing — lowest priority, approximate via env var caps for now
+- §3.3 executor cache key workspace hash — absorbed into normative §3.3.
+- Default `.env.example` — committed, matches §15.1.
+- Priority order — superseded by normative §7.1.
+- All Codex revision notes — superseded by §17 and §18.
 
 ---
 
@@ -362,14 +365,9 @@ Codex updated §12 to explicitly state: "Baseline remains a required prerequisit
 - QA floor ("red only if approval rate drops >2%") is practical and appropriate.
 - Baseline-first rollout order stands as written in §7.1 and §10.
 
-### Combined Policy (§12 + §13)
+### Combined Policy
 
-1. Establish benchmark baseline — hard prerequisite, no metrics are computable without it.
-2. Apply soft-gate zones to every subsequent change:
-   - `Green` (≥35% runtime improvement, ≥+20% first-pass success, ≥30% healing reduction): proceed.
-   - `Amber` (below target but above floor): proceed with watchlist, escalate after two consecutive amber windows on the same metric.
-   - `Red` (below floor or QA drops >2%): pause, revert, tune.
-3. Evaluate on rolling windows of 10-20 runs, not individual runs.
+Resolved and promoted to normative §7.2. Follow §7.2 for the governing decision policy.
 
 ---
 
@@ -390,10 +388,11 @@ Codex updated §12 to explicitly state: "Baseline remains a required prerequisit
 - Revisit these budgets after each benchmark cycle.
 
 ### 14.3 Retry and Fallback Rules
-- On timeout/empty output/non-zero exit:
-  - retry once on same model
-  - if retry fails, fallback to configured backup CLI provider for that role
-- Log retry count and fallback reason in stage telemetry.
+- Retry only transient errors: `timeout`, `429`-equivalent, empty output, transient CLI non-zero exit. Do not retry structural failures (bad prompt, missing binary).
+- Bounded attempts: max 2 retries with jittered backoff before escalating to fallback.
+- Role fallback chain: `primary provider → fallback provider/model` per role. Fallback must be pre-configured — do not guess.
+- If both primary and fallback fail, propagate `LLMError` to orchestrator and mark stage as failed.
+- Log retry count, error class, and fallback reason in `StageTrace` per §15.2.
 
 ### 14.4 Output Quality Guardrails
 - Reject generation output when it contains:
@@ -403,11 +402,13 @@ Codex updated §12 to explicitly state: "Baseline remains a required prerequisit
 - For code stages, persist only after structure checks pass (JSON validity or code sanity checks).
 
 ### 14.5 Prompt Size Guardrail
-- Enforce per-role prompt size caps.
-- If cap exceeded:
-  - reduce context (API-surface extraction, compact architecture context)
-  - retry once with reduced prompt
-- Log prompt-reduction events.
+- Enforce per-role prompt character caps (GeminiCLIClient already does this — extend to all clients).
+- If cap exceeded, apply pruning in order:
+  1. Soft trim: replace oversized sections with extracted API surface (`_extract_api_surface()` already exists in `test_writer.py`).
+  2. Hard clear: remove low-signal historic blobs (old file contents, previous attempt diffs).
+  3. Always preserve: latest source file, failing test output, and active contracts.
+- Retry once with pruned prompt. If still oversized, fail with a descriptive error.
+- Log all prompt-reduction events in `StageTrace`.
 
 ### 14.6 Claude Stability Metrics
 Track per-role:
@@ -418,7 +419,7 @@ Track per-role:
 - invalid-output rejection rate
 
 ### 14.7 Soft-Gate Integration
-- Evaluate Claude role performance with the Green/Amber/Red policy from §12.
+- Evaluate Claude role performance with the Green/Amber/Red policy in §7.2.
 - `Amber`: proceed with mitigation notes.
 - `Red`: tune route/model/concurrency immediately for that role.
 
@@ -484,7 +485,7 @@ CODEGEN_QA_AUDITOR_MODEL=claude-sonnet-4-6
 Notes:
 - `CODEGEN_EXECUTOR_MODEL` and `CODEGEN_HEALER_MODEL` are left blank — codex CLI picks its own default and there is no stable model alias to pin yet.
 - This template is the starting point. Update model names after each benchmark cycle per §14.1.
-- Ollama lines are commented out until a benchmark run validates quality for those roles per §12.
+- Ollama lines are commented out until a benchmark run validates quality for those roles per §7.2.
 
 ### 15.2 `StageTrace` Schema
 
@@ -516,22 +517,25 @@ stage_traces: List[StageTrace] = field(default_factory=list)
 Usage pattern in orchestrator — wrap each stage:
 ```python
 _t0 = time.monotonic()
+start_wall = time.time()
 result = await some_stage_call(...)
-    traces.append(StageTrace(
-        stage="architect",
-        provider=router.get_provider_name("architect"),
-        model=router.get_model_name("architect"),
-        start_monotonic=_t0,
-        end_monotonic=time.monotonic(),
-        duration_seconds=time.monotonic() - _t0,
-        start_unix_ts=start_wall,
-        end_unix_ts=end_wall,
-        prompt_chars=len(prompt_sent),
-        response_chars=len(result_text),
-    ))
+_t1 = time.monotonic()
+end_wall = time.time()
+traces.append(StageTrace(
+    stage="architect",
+    provider=router.get_provider_name("architect"),
+    model=router.get_model_name("architect"),
+    start_monotonic=_t0,
+    end_monotonic=_t1,
+    duration_seconds=_t1 - _t0,
+    start_unix_ts=start_wall,
+    end_unix_ts=end_wall,
+    prompt_chars=len(prompt_sent),
+    response_chars=len(result_text),
+))
 ```
 
-This feeds directly into the §14.6 stability metrics (latency, timeout rate, fallback rate) and the §12 rolling-window evaluation.
+This feeds directly into the §14.6 stability metrics (latency, timeout rate, fallback rate) and the §7.2 rolling-window evaluation.
 
 ---
 
@@ -560,3 +564,86 @@ This feeds directly into the §14.6 stability metrics (latency, timeout rate, fa
 ### Verdict
 
 **APPROVE §14 as a policy document.** Two items need follow-up implementation tickets before they can be considered done: §14.3 retry/fallback logic and §14.5 prompt-size auto-reduction. Track these explicitly in the checklist in §8.
+
+---
+
+## 17. Claude Review of Codex Changes (Archival, Non-Normative)
+**Reviewer:** Claude Sonnet 4.6
+**Date:** 2026-02-27
+
+### What Codex Got Right
+
+**Governance section is excellent.** Separating normative (§1–§9, §14, §15) from archival (§10 onward) is the right call. The document was growing into a multi-author conversation with no clear source of truth. Now it's unambiguous: if any archival section and §3 disagree, follow §3.
+
+**§7.2 soft-gate integration is correct.** The Green/Amber/Red policy from §12 has been promoted into the normative safety checks section where it belongs. §12 is now truly archival — its substance lives in §7.2. This is the right way to absorb a review recommendation into the plan.
+
+**§3.3 cache key extension absorbed correctly.** The executor workspace/file-tree hash requirement from §10 is now in the normative plan. Good.
+
+**§8 checklist additions are correct.** §14.3 and §14.5 are now explicitly tracked as open work items. This is exactly what §16 asked for.
+
+**§15.2 StageTrace timestamp improvement is correct.** Adding both `start_monotonic/end_monotonic` (for duration accuracy) and `start_unix_ts/end_unix_ts` (for cross-run wall-clock reporting) is better than the original monotonic-only schema. The distinction matters: monotonic prevents drift within a run, wall-clock enables comparison across runs in the benchmark report.
+
+**Ollama scoped out cleanly.** Removed from §3.2 default matrix, removed from §14, marked as future lane pending client/router support. Correct — it was premature in earlier drafts.
+
+### Issues Raised (all resolved in subsequent patch)
+
+- **§15.2 timing bug** — `time.monotonic()` called twice, causing `end_monotonic` and `duration_seconds` to diverge. Fixed: `_t1` captured once, both fields derived from it.
+- **§3.2 healer ambiguity** — "`claude_cli` or `codex_cli`" resolved to `codex_cli` by default with an explicit switch rule tied to the rolling window policy.
+- **§14.3 and §14.5 normative status** — aspirational until §8 checklist items are checked. Tracked, no further action needed.
+
+### Verdict
+
+All normative changes approved. All flagged issues resolved in the same-day patch reviewed in §18.
+
+---
+
+## 18. Claude Patch Review (Archival, Non-Normative)
+**Reviewer:** Claude Sonnet 4.6
+**Date:** 2026-02-27
+
+### Changes Made
+
+| Issue from §17 | Fix Applied | Correct |
+|----------------|-------------|---------|
+| Timing bug in §15.2 — `time.monotonic()` called twice | `_t1` captured once, `end_monotonic` and `duration_seconds` both derived from it. `start_wall`/`end_wall` via `time.time()` captured correctly around the call. | Yes |
+| Healer ambiguity in §3.2 | Default is now `codex_cli`; switch rule documented: "switch to `claude_cli` if healer quality is red for two consecutive rolling windows." Matches §15.1 `.env.example`. | Yes |
+| §7.2 referenced §12 instead of carrying the bands inline | Metric bands promoted directly into §7.2. §7.2 is now self-contained — no normative dependency on archival §12. | Yes |
+| §14.7 referenced §12 | Updated to reference §7.2 where the policy now lives. | Yes |
+| §15.2 and §15.1 cross-references to §12 | Updated to §7.2. | Yes |
+| §17 not listed in governance archival list | Added to governance section. | Yes |
+
+### Remaining Open Item
+
+**§14.3 and §14.5 normative status** was flagged in §17 but not addressed in this patch. Both subsections remain listed under normative §14 despite not being implemented. This is acceptable because the §8 checklist explicitly tracks them as open — any developer reading the plan will see the unchecked boxes before treating them as live policy. No further action needed; noting for the record.
+
+### Verdict
+
+Patch is clean. All two flagged bugs are fixed. All cross-references updated consistently. The document is now in its best state: normative sections are self-contained, archival sections are clearly labeled, metric bands live in §7.2 where they belong.
+
+---
+
+## 19. OpenClaw Integration Mapping (Archival, Non-Normative)
+**Source:** `docs/openclaw_review.md` — snapshot `f943c76`
+**Date merged:** 2026-02-27
+
+### Adoption Map
+
+| OpenClaw Item | Priority | Merged Into |
+|---------------|----------|-------------|
+| Router retry + model/provider failover | High | §14.3 — enriched with transient-only policy, jittered backoff, role fallback chain |
+| Prompt pruning for executor/healer | High | §14.5 — enriched with soft trim → hard clear → preserve key context order |
+| Queue/lane concurrency guard | Medium | §5.4 — new subsection; §8 checklist item added |
+| `health` + `doctor` commands | Medium | §3.5 — new subsection; §8 checklist item added; §7.1 rollout step 4 |
+| Telemetry and usage surfaces | Already covered | §2.1, §15.2 StageTrace schema — no change needed |
+| Skill gating metadata | Low/Future | §8 checklist — marked `(Future)` |
+| Tool policy tiers / sandbox | Low/Future | §8 checklist — marked `(Future)` |
+
+### Key Note Applied
+
+OpenClaw note: "Implement failover and pruning before aggressive throughput tuning, otherwise benchmarks will be noisy and unstable."
+
+Applied: §7.1 rollout order updated — router retry/failover and prompt pruning moved to step 2, before heal consolidation, telemetry, and all throughput work.
+
+### Dropped Items
+
+Channel/messaging integrations, telephony, voice, and social platform plugins — out of scope for a coding-agent-first system. Not adopted.

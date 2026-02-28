@@ -1,7 +1,9 @@
 from __future__ import annotations
+import os
 import logging
 import re
 import shlex
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +27,31 @@ _NODE_MISSING_MODULE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _ALLOWED_DEPENDENCY_NAME = re.compile(r"^[A-Za-z0-9._/@-]+$")
+# Python dev tools safe to auto-install when referenced in validation commands.
+_VALIDATION_TOOL_WHITELIST: frozenset[str] = frozenset({
+    "ruff", "black", "mypy", "isort", "flake8", "pylint",
+    "bandit", "pyright", "pyflakes", "pep8", "autopep8",
+})
+# Top-level import name → pip package name for common frameworks.
+# Used when no requirements.txt/pyproject.toml is present.
+_FRAMEWORK_IMPORT_MAP: dict[str, str] = {
+    "fastapi": "fastapi[standard]",
+    "uvicorn": "uvicorn",
+    "flask": "flask",
+    "django": "django",
+    "sqlalchemy": "sqlalchemy",
+    "alembic": "alembic",
+    "pydantic": "pydantic",
+    "httpx": "httpx",
+    "aiohttp": "aiohttp",
+    "celery": "celery",
+    "redis": "redis",
+    "pymongo": "pymongo",
+    "motor": "motor",
+    "boto3": "boto3",
+    "requests": "requests",
+    "starlette": "starlette",
+}
 
 
 @dataclass(frozen=True)
@@ -41,7 +68,12 @@ class DependencyManager:
         self.workspace = workspace
         self.executor = run_shell_command
 
-    async def resolve_and_install(self, generated_files: List[GeneratedFile], plan: Plan) -> Dict[str, Any]:
+    async def resolve_and_install(
+        self,
+        generated_files: List[GeneratedFile],
+        plan: Plan,
+        validation_commands: List[str] | None = None,
+    ) -> Dict[str, Any]:
         """Stage 4: Analyze generated files and install inferred dependencies."""
         import asyncio
         workspace_root = Path(self.workspace).resolve()
@@ -67,19 +99,112 @@ class DependencyManager:
             labels.append("pyproject.toml")
 
         results: Dict[str, Any] = {"installed_manifests": [], "errors": []}
-        if not tasks:
-            return results
+        if tasks:
+            cmd_results = await asyncio.gather(*tasks, return_exceptions=True)
+            for label, res in zip(labels, cmd_results):
+                if isinstance(res, Exception):
+                    results["errors"].append(f"{label} install raised: {res}")
+                elif res.exit_code == 0:
+                    results["installed_manifests"].append(label)
+                else:
+                    results["errors"].append(f"{label} install failed: {res.stderr}")
 
-        cmd_results = await asyncio.gather(*tasks, return_exceptions=True)
-        for label, res in zip(labels, cmd_results):
-            if isinstance(res, Exception):
-                results["errors"].append(f"{label} install raised: {res}")
-            elif res.exit_code == 0:
-                results["installed_manifests"].append(label)
-            else:
-                results["errors"].append(f"{label} install failed: {res.stderr}")
+        # Install any whitelisted validation tools that are missing from the environment.
+        if validation_commands:
+            workspace_root = Path(self.workspace).resolve()
+            for cmd in validation_commands:
+                parts = cmd.strip().split()
+                if not parts:
+                    continue
+                tool = parts[0]
+                if tool not in _VALIDATION_TOOL_WHITELIST:
+                    continue
+                if shutil.which(tool) is not None:
+                    continue   # already installed
+                print(f"  [DependencyManager] Installing missing validation tool: {tool}")
+                install_cmd = f"{shlex.quote(sys.executable)} -m pip install {shlex.quote(tool)}"
+                try:
+                    res = await asyncio.to_thread(self.executor, install_cmd, str(workspace_root))
+                    if res.exit_code == 0:
+                        print(f"  [DependencyManager] Installed: {tool}")
+                    else:
+                        print(
+                            f"  [DependencyManager] Failed to install {tool}: "
+                            f"{res.stderr.strip()[:200]}"
+                        )
+                        results["errors"].append(f"tool install failed: {tool}")
+                except Exception as exc:
+                    results["errors"].append(f"tool install crashed: {tool}: {exc}")
+
+        # If no manifest was found, scan imports and install known frameworks.
+        has_manifest = bool(
+            (workspace_root / "requirements.txt").exists()
+            or (workspace_root / "pyproject.toml").exists()
+            or (workspace_root / "package.json").exists()
+        )
+        if not has_manifest:
+            framework_installs = await self._install_inferred_frameworks(
+                generated_files, workspace_root
+            )
+            results["framework_installs"] = framework_installs
+
+        # Ensure root-level Python modules are importable by pytest.
+        injected = self._ensure_conftest(workspace_root, generated_files)
+        if injected:
+            print("  [DependencyManager] Wrote conftest.py to make root modules importable.")
+        results["conftest_injected"] = injected
 
         return results
+
+    async def _install_inferred_frameworks(
+        self,
+        generated_files: List[GeneratedFile],
+        workspace_root: Path,
+    ) -> list[str]:
+        """Scan generated Python files for known framework imports and install them."""
+        import asyncio
+        import importlib.util
+
+        needed: dict[str, str] = {}  # import_name → pip_package
+        for f in generated_files:
+            if not f.file_path.endswith(".py"):
+                continue
+            for line in f.content.splitlines():
+                line = line.strip()
+                if not (line.startswith("import ") or line.startswith("from ")):
+                    continue
+                # Extract top-level module name
+                parts = line.split()
+                top = parts[1].split(".")[0] if len(parts) > 1 else ""
+                if top in _FRAMEWORK_IMPORT_MAP and top not in needed:
+                    # Only install if not already importable
+                    if importlib.util.find_spec(top) is None:
+                        needed[top] = _FRAMEWORK_IMPORT_MAP[top]
+
+        if not needed:
+            return []
+
+        installed: list[str] = []
+        packages = list(needed.values())
+        print(f"  [DependencyManager] Installing inferred frameworks: {packages}")
+        install_cmd = (
+            f"{shlex.quote(sys.executable)} -m pip install "
+            + " ".join(shlex.quote(p) for p in packages)
+        )
+        try:
+            res = await asyncio.to_thread(self.executor, install_cmd, str(workspace_root))
+            if res.exit_code == 0:
+                installed = packages
+                print(f"  [DependencyManager] Installed: {packages}")
+            else:
+                print(
+                    f"  [DependencyManager] Framework install failed: "
+                    f"{res.stderr.strip()[:300]}"
+                )
+        except Exception as exc:
+            print(f"  [DependencyManager] Framework install crashed: {exc}")
+
+        return installed
 
     def check_and_fix_dependencies(
         self,
@@ -177,3 +302,81 @@ class DependencyManager:
     @staticmethod
     def _is_allowed_dependency_name(name: str) -> bool:
         return bool(name) and bool(_ALLOWED_DEPENDENCY_NAME.match(name))
+
+    @staticmethod
+    def _ensure_conftest(
+        workspace_root: Path,
+        generated_files: List[GeneratedFile],
+        extra_test_paths: Optional[List[str]] = None,
+    ) -> bool:
+        """Write a minimal conftest.py if root-level Python source modules exist
+        alongside a tests/ subdirectory and no conftest.py is already present.
+
+        This makes flat-package projects (prime.py, utils.py at root) importable
+        when the test runner is invoked as ``pytest tests/`` without a proper
+        pyproject.toml [project] section or pythonpath setting.
+        """
+        conftest_path = workspace_root / "conftest.py"
+        if conftest_path.exists():
+            return False
+
+        # Root-level .py files that are not test files or conftest itself
+        root_modules = [
+            f for f in generated_files
+            if f.file_path.endswith(".py")
+            and "/" not in f.file_path
+            and not f.file_path.startswith("test_")
+            and f.file_path != "conftest.py"
+        ]
+
+        def _is_subdir_test(path: str) -> bool:
+            normalized = path.replace("\\", "/")
+            name = os.path.basename(normalized)
+            return (
+                "/" in normalized
+                and normalized.endswith(".py")
+                and (
+                    name.startswith("test_")
+                    or name.endswith("_test.py")
+                    or "/tests/" in normalized
+                )
+            )
+
+        # Any Python test file living in a subdirectory.
+        has_test_subdir = any(_is_subdir_test(f.file_path) for f in generated_files)
+        if not has_test_subdir and extra_test_paths:
+            has_test_subdir = any(_is_subdir_test(path) for path in extra_test_paths)
+        if not has_test_subdir:
+            tests_dir = workspace_root / "tests"
+            if tests_dir.is_dir():
+                has_test_subdir = any(
+                    py.is_file()
+                    and (py.name.startswith("test_") or py.name.endswith("_test.py"))
+                    for py in tests_dir.rglob("*.py")
+                )
+
+        # src/ layout: Python files live under src/, tests under tests/
+        has_src_layout = (workspace_root / "src").is_dir() and any(
+            f.file_path.startswith("src/") and f.file_path.endswith(".py")
+            for f in generated_files
+        )
+
+        if (root_modules or has_src_layout) and has_test_subdir:
+            extra_paths = []
+            if has_src_layout:
+                extra_paths.append(
+                    "SRC = os.path.join(ROOT, 'src')\n"
+                    "if SRC not in sys.path:\n"
+                    "    sys.path.insert(0, SRC)\n"
+                )
+            conftest_path.write_text(
+                "import os\n"
+                "import sys\n\n"
+                "ROOT = os.path.dirname(os.path.abspath(__file__))\n"
+                "if ROOT not in sys.path:\n"
+                "    sys.path.insert(0, ROOT)\n"
+                + "".join(extra_paths)
+            )
+            return True
+
+        return False

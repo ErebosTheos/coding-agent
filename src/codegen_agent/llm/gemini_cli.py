@@ -82,6 +82,7 @@ class GeminiCLIClient(LLMClient):
         env = dict(os.environ)
         if self.api_key:
             env["GEMINI_API_KEY"] = self.api_key
+        timeout = int(os.environ.get("CODEGEN_LLM_TIMEOUT", "120"))
 
         command: list[str] = [
             self.binary,
@@ -105,11 +106,11 @@ class GeminiCLIClient(LLMClient):
             try:
                 stdout, stderr = await asyncio.wait_for(
                     process.communicate(), 
-                    timeout=self.timeout_seconds
+                    timeout=timeout
                 )
             except asyncio.TimeoutError:
                 process.kill()
-                raise LLMTimeoutError(f"Gemini CLI timed out after {self.timeout_seconds}s")
+                raise LLMTimeoutError(f"Gemini CLI timed out after {timeout}s")
             
             stdout_str = stdout.decode().strip()
             stderr_str = stderr.decode().strip()
