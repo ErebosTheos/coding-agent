@@ -166,6 +166,14 @@ async def main_async():
         help="Maximum heal iterations (0 = skip healing, default: 3)",
     )
 
+    # --- 'serve' subcommand ---
+    serve_parser = subparsers.add_parser("serve", help="Start the web dashboard")
+    serve_parser.add_argument("--host", type=str, default="127.0.0.1")
+    serve_parser.add_argument("--port", type=int, default=7070)
+    serve_parser.add_argument("--output-dir", type=str, default="./output", dest="output_dir")
+    serve_parser.add_argument("--inbox-dir", type=str, default="./inbox", dest="inbox_dir")
+    serve_parser.add_argument("--config", type=str)
+
     # --- 'health' subcommand ---
     subparsers.add_parser("health", help="Check environment and provider readiness")
     doctor_parser = subparsers.add_parser("doctor", help="Show rolling-window pipeline metrics")
@@ -179,6 +187,17 @@ async def main_async():
     status_parser.add_argument("--workspace", type=str, default="./output")
 
     args = parser.parse_args()
+
+    if args.command == "serve":
+        from .dashboard.server import start_server
+        await start_server(
+            host=args.host,
+            port=args.port,
+            output_dir=os.path.abspath(args.output_dir),
+            inbox_dir=os.path.abspath(args.inbox_dir),
+            config_path=args.config,
+        )
+        return
 
     if args.command == "health":
         sys.exit(_run_health_check())

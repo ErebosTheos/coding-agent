@@ -1,7 +1,13 @@
 import asyncio
+import os
 from pathlib import Path
 
-from codegen_agent.executor import Executor, _fix_relative_imports
+from codegen_agent.executor import (
+    Executor,
+    _ensure_async_sessionmaker_guardrail,
+    _fix_relative_imports,
+    _sanitize_source_text,
+)
 from codegen_agent.models import Architecture, ExecutionNode, ExecutionResult
 
 
@@ -91,6 +97,37 @@ def test_fix_relative_imports_php_unchanged():
     assert result == content
 
 
+def test_async_sessionmaker_guardrail_injects_expire_on_commit():
+    content = (
+        "from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker\n"
+        "SessionLocal = async_sessionmaker(engine, class_=AsyncSession)\n"
+    )
+    result = _ensure_async_sessionmaker_guardrail("src/database.py", content)
+    assert "expire_on_commit=False" in result
+    assert "async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)" in result
+
+
+def test_async_sessionmaker_guardrail_preserves_existing_setting():
+    content = (
+        "SessionLocal = async_sessionmaker(\n"
+        "    engine,\n"
+        "    class_=AsyncSession,\n"
+        "    expire_on_commit=False,\n"
+        ")\n"
+    )
+    result = _ensure_async_sessionmaker_guardrail("src/database.py", content)
+    assert result == content
+
+
+def test_sanitize_source_text_removes_zero_width_chars_for_python():
+    content = "x = 1\u200b\n\ufeffy = 2\n"
+    result = _sanitize_source_text("src/main.py", content)
+    assert "\u200b" not in result
+    assert "\ufeff" not in result
+    assert "x = 1" in result
+    assert "y = 2" in result
+
+
 def test_execute_skips_directory_nodes(tmp_path):
     llm = DummyLLM('{"pkg/__init__.py": ""}')
     executor = Executor(llm_client=llm, workspace=str(tmp_path), max_bulk_files=99)
@@ -108,3 +145,52 @@ def test_execute_skips_directory_nodes(tmp_path):
     assert result.failed_nodes == []
     assert "pkg_dir" in result.skipped_nodes
     assert (Path(tmp_path) / "pkg" / "__init__.py").exists()
+
+
+def test_executor_env_zero_bulk_disables_bulk_generation(tmp_path):
+    old = os.environ.get("CODEGEN_EXECUTOR_MAX_BULK_FILES")
+    os.environ["CODEGEN_EXECUTOR_MAX_BULK_FILES"] = "0"
+    try:
+        llm = DummyLLM('{"app/main.py":"print(1)"}')
+        executor = Executor(llm_client=llm, workspace=str(tmp_path), max_bulk_files=-1)
+        assert executor.max_bulk_files == 0
+    finally:
+        if old is None:
+            del os.environ["CODEGEN_EXECUTOR_MAX_BULK_FILES"]
+        else:
+            os.environ["CODEGEN_EXECUTOR_MAX_BULK_FILES"] = old
+
+
+def test_calculate_waves_cycle_falls_back_to_deterministic_waves(tmp_path):
+    llm = DummyLLM("{}")
+    executor = Executor(llm_client=llm, workspace=str(tmp_path), concurrency=2, max_bulk_files=1)
+    nodes = [
+        ExecutionNode(node_id="a", file_path="src/a.py", purpose="a", depends_on=["b"]),
+        ExecutionNode(node_id="b", file_path="src/b.py", purpose="b", depends_on=["a"]),
+    ]
+
+    waves = executor._calculate_waves(nodes)
+    flattened = [n.node_id for wave in waves for n in wave]
+    assert set(flattened) == {"a", "b"}
+    assert len(flattened) == 2
+
+
+def test_calculate_waves_cycle_strict_mode_raises(tmp_path):
+    old = os.environ.get("CODEGEN_STRICT_DEP_GRAPH")
+    os.environ["CODEGEN_STRICT_DEP_GRAPH"] = "1"
+    try:
+        llm = DummyLLM("{}")
+        executor = Executor(llm_client=llm, workspace=str(tmp_path), concurrency=2, max_bulk_files=1)
+        nodes = [
+            ExecutionNode(node_id="a", file_path="src/a.py", purpose="a", depends_on=["b"]),
+            ExecutionNode(node_id="b", file_path="src/b.py", purpose="b", depends_on=["a"]),
+        ]
+
+        import pytest
+        with pytest.raises(ValueError, match="Cycle detected"):
+            executor._calculate_waves(nodes)
+    finally:
+        if old is None:
+            del os.environ["CODEGEN_STRICT_DEP_GRAPH"]
+        else:
+            os.environ["CODEGEN_STRICT_DEP_GRAPH"] = old

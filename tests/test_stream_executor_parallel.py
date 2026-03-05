@@ -31,11 +31,17 @@ class _FakeExecutor:
     """Executor stub whose _stream_bulk() returns canned files."""
     def __init__(self, files: list[GeneratedFile] | None = None):
         self.concurrency = 4
+        self.max_bulk_files = 20
         self._files = files or []
         self.stream_bulk_called = False
+        self.execute_called = False
 
     async def _stream_bulk(self, architecture):
         self.stream_bulk_called = True
+        return ExecutionResult(generated_files=self._files)
+
+    async def execute(self, architecture):
+        self.execute_called = True
         return ExecutionResult(generated_files=self._files)
 
 
@@ -100,6 +106,21 @@ def test_stream_executor_returns_correct_files():
 
     paths = {f.file_path for f in result.generated_files}
     assert paths == {"file1.py", "file2.py", "file3.py"}
+
+
+def test_stream_executor_respects_bulk_limit_and_uses_execute():
+    """When bulk is disabled, stream executor should use normal execute()."""
+    files = _fake_files(3)
+    llm = _FakeStreamingLLM(_arch_payload(3))
+    executor = _FakeExecutor(files=files)
+    executor.max_bulk_files = 0
+    stream_exec = StreamingPlanArchExecutor(llm, executor)
+
+    _, _, result = asyncio.run(stream_exec.run("build demo"))
+
+    assert executor.execute_called is True
+    assert executor.stream_bulk_called is False
+    assert len(result.generated_files) == 3
 
 
 def test_bulk_file_parser_basic():

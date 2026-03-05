@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import ClassVar, Iterable, Dict, List
 from .models import Plan, TestSuite
 from .llm.protocol import LLMClient
-from .utils import extract_code_from_markdown
+from .utils import extract_code_from_markdown, prune_prompt
+from .executor import _BulkFileParser, _fix_utcnow, _fix_httpx_async_transport, _fix_orm_sessionmaker
 
 @dataclass
 class TestWriter:
@@ -26,29 +27,61 @@ class TestWriter:
         files_content: Dict[str, str],
     ) -> TestSuite:
         framework = self.detect_framework()
-        generated_files: Dict[str, str] = {}
+        n = len(files_content)
 
-        # If project is small, batch all tests in one LLM call
-        if len(files_content) <= self.max_batch_size:
-            print(f"  [TestWriter] Small project detected ({len(files_content)} files). Using bulk test generation.")
+        # Stream-bulk: one LLM call for all test files, written as JSON values arrive.
+        # Gives all source files as shared context → consistent imports and fixtures.
+        # Falls back to regular bulk (no streaming) or parallel single-file calls.
+        if hasattr(self.llm_client, "astream"):
+            print(f"  [TestWriter] Generating {n} test file(s) via stream-bulk.")
+            generated_files = await self._generate_stream_bulk(plan, framework, files_content)
+        elif n <= self.max_batch_size:
+            print(f"  [TestWriter] Small project ({n} files). Using bulk test generation.")
             generated_files = await self._generate_bulk(plan, framework, files_content)
         else:
-            print("  [TestWriter] Large project detected. Generating tests in parallel.")
-            tasks = []
-            for source_path, content in files_content.items():
-                tasks.append(self._generate_single_test(plan, framework, source_path, content))
-            
+            print(f"  [TestWriter] Large project ({n} files). Generating tests in parallel.")
+            tasks = [
+                self._generate_single_test(plan, framework, sp, c)
+                for sp, c in files_content.items()
+            ]
             results = await asyncio.gather(*tasks)
-            for test_path, test_content in results:
-                if test_content:
-                    generated_files[test_path] = test_content
+            generated_files = {tp: tc for tp, tc in results if tc}
 
         validation_commands = self.build_validation_commands(generated_files.keys())
         return TestSuite(
             test_files=generated_files,
             validation_commands=validation_commands,
-            framework=framework
+            framework=framework,
         )
+
+    async def _generate_stream_bulk(
+        self, plan: Plan, framework: str, files_content: Dict[str, str]
+    ) -> Dict[str, str]:
+        """One streaming LLM call for all test files — writes each file as its JSON value
+        arrives in the stream. Falls back to _generate_bulk if stream produces incomplete JSON."""
+        prompt = self._build_bulk_test_prompt(plan, framework, files_content)
+        prompt = prune_prompt(prompt, max_chars=28_000)
+
+        parser = _BulkFileParser()
+        generated_files: Dict[str, str] = {}
+
+        async for chunk in self.llm_client.astream(prompt):
+            for test_path, content in parser.feed(chunk):
+                if not content.strip():
+                    continue
+                content = self._apply_test_guardrails(test_path, content)
+                full_path = os.path.join(self.workspace, test_path)
+                os.makedirs(os.path.dirname(full_path), exist_ok=True)
+                with open(full_path, "w") as f:
+                    f.write(content)
+                print(f"  [TestWriter] Created test file: {test_path}")
+                generated_files[test_path] = content
+
+        if not generated_files:
+            print("  [TestWriter] Stream-bulk produced no files. Falling back to bulk.")
+            return await self._generate_bulk(plan, framework, files_content)
+
+        return generated_files
 
     async def _generate_bulk(self, plan: Plan, framework: str, files_content: Dict[str, str]) -> Dict[str, str]:
         """Generates all tests in a single LLM call."""
@@ -71,13 +104,14 @@ class TestWriter:
 
         generated_files = {}
         for test_path, content in data.items():
+            content = self._apply_test_guardrails(test_path, content)
             full_test_path = os.path.join(self.workspace, test_path)
             os.makedirs(os.path.dirname(full_test_path), exist_ok=True)
             with open(full_test_path, 'w') as f:
                 f.write(content)
             print(f"  [TestWriter] Created test file: {test_path}")
             generated_files[test_path] = content
-        
+
         return generated_files
 
     async def _generate_single_test(self, plan: Plan, framework: str, source_path: str, source_content: str) -> tuple[str, str | None]:
@@ -94,10 +128,11 @@ class TestWriter:
         normalized = self._normalize_generated_content(response)
         if not normalized.strip():
             return test_path, None
-        
+
+        normalized = self._apply_test_guardrails(test_path, normalized)
         if not normalized.endswith("\n"):
             normalized = f"{normalized}\n"
-        
+
         full_test_path = os.path.join(self.workspace, test_path)
         os.makedirs(os.path.dirname(full_test_path), exist_ok=True)
         with open(full_test_path, 'w') as f:
@@ -196,6 +231,16 @@ class TestWriter:
             "The test MUST exercise the real target module/API; do not invent hypothetical wrappers.\n"
             "Do not write placeholder commentary like 'cannot inspect' or 'in a real scenario'.\n"
             "Use deterministic tests with no network calls.\n\n"
+            "CRITICAL test infrastructure rules — violating these breaks the test suite:\n"
+            "- SQLAlchemy async fixtures: use `async_sessionmaker` from `sqlalchemy.ext.asyncio`,\n"
+            "  NOT `sessionmaker` from `sqlalchemy.orm`. Example:\n"
+            "  `from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker`\n"
+            "  `SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)`\n"
+            "- httpx AsyncClient: NEVER use `AsyncClient(app=app, base_url=...)`. Always use:\n"
+            "  `from httpx import AsyncClient, ASGITransport`\n"
+            "  `AsyncClient(transport=ASGITransport(app=app), base_url='http://test')`\n"
+            "- conftest.py: if the app reads env vars at import time (e.g. SECRET_KEY),\n"
+            "  set them with `os.environ.setdefault(...)` BEFORE any `from src.xxx import` line.\n\n"
             f"Testing Framework: {framework}\n"
             f"Project: {plan.project_name}\n"
             f"Features:\n{features}\n"
@@ -223,12 +268,30 @@ class TestWriter:
             "Quality bar: Each test file should include one happy-path and at least two edge-case tests.\n\n"
             "Each test file must import and exercise the real corresponding source module.\n"
             "Do not create fake UI harnesses or hypothetical app classes as substitutes.\n\n"
+            "CRITICAL test infrastructure rules — violating these breaks the test suite:\n"
+            "- SQLAlchemy async fixtures: use `async_sessionmaker` from `sqlalchemy.ext.asyncio`,\n"
+            "  NOT `sessionmaker` from `sqlalchemy.orm`. Example:\n"
+            "  `from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker`\n"
+            "  `SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)`\n"
+            "- httpx AsyncClient: NEVER use `AsyncClient(app=app, base_url=...)`. Always use:\n"
+            "  `from httpx import AsyncClient, ASGITransport`\n"
+            "  `AsyncClient(transport=ASGITransport(app=app), base_url='http://test')`\n"
+            "- conftest.py: if the app reads env vars at import time (e.g. SECRET_KEY),\n"
+            "  set them with `os.environ.setdefault(...)` BEFORE any `from src.xxx import` line.\n\n"
             f"Testing Framework: {framework}\n"
             f"Project: {plan.project_name}\n"
             f"Features:\n{features}\n"
             f"Tech Stack: {plan.tech_stack}\n\n"
             "Source Files:\n" + "\n\n".join(files_info)
         )
+
+    @staticmethod
+    def _apply_test_guardrails(test_path: str, content: str) -> str:
+        """Apply deterministic fixes to generated test files."""
+        content = _fix_utcnow(test_path, content)
+        content = _fix_httpx_async_transport(test_path, content)
+        content = _fix_orm_sessionmaker(test_path, content)
+        return content
 
     @staticmethod
     def _normalize_generated_content(raw_output: str) -> str:

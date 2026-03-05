@@ -100,7 +100,8 @@ class CheckpointManager:
                 success=d['success'],
                 attempts=attempts,
                 final_command_result=final_res,
-                blocked_reason=d.get('blocked_reason')
+                blocked_reason=d.get('blocked_reason'),
+                cache_hits=d.get('cache_hits', 0),
             )
 
         def dict_to_qa(d):
@@ -121,5 +122,6 @@ class CheckpointManager:
             healing_report=dict_to_heal(data.get('healing_report')),
             qa_report=dict_to_qa(data.get('qa_report')),
             visual_audit=dict_to_visual(data.get('visual_audit')),
-            wall_clock_seconds=data.get('wall_clock_seconds', 0.0)
+            wall_clock_seconds=data.get('wall_clock_seconds', 0.0),
+            first_pass_success=data.get('first_pass_success', False),
         )

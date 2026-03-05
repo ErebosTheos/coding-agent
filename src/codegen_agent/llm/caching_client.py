@@ -36,5 +36,14 @@ class CachingLLMClient:
         return response
 
     async def astream(self, prompt: str, system_prompt: str = "") -> AsyncIterator[str]:
+        key = self._cache_key(prompt, system_prompt)
+        cached = self._cache.get(key, self._provider, self._model)
+        if cached is not None:
+            yield cached
+            return
+        chunks: list[str] = []
         async for chunk in self._client.astream(prompt, system_prompt=system_prompt):
+            chunks.append(chunk)
             yield chunk
+        if chunks:
+            self._cache.set(key, self._provider, self._model, "".join(chunks))

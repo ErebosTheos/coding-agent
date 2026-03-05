@@ -13,104 +13,68 @@ from codegen_agent.orchestrator import Orchestrator
 
 BENCHMARK_PROMPTS = [
     {
-        "tier": "large",
-        "slug": "dashboard_ui",
+        "tier": "small",
+        "slug": "prime_checker",
         "prompt": (
-            "Build a stunning premium SaaS analytics dashboard as a single self-contained index.html "
-            "with all CSS in a <style> block and all JS in a <script> block. "
-            "CDN links allowed (Google Fonts only). Zero dependencies, zero build tools. "
-            ""
-            "VISUAL IDENTITY: "
-            "Background: deep navy #0a0e1a. "
-            "Sidebar: #0d1117 with a 1px right border in #1e2433. "
-            "Cards: #111827 background, 1px border #1e2d3d, border-radius 16px. "
-            "Primary accent: electric blue #3b82f6. Secondary: violet #8b5cf6. "
-            "Success: #10b981. Warning: #f59e0b. Danger: #ef4444. "
-            "All text on Inter (Google Fonts). Headings bold 600+, body 400. "
-            "Subtle blue glow (box-shadow: 0 0 40px rgba(59,130,246,0.08)) on hover states. "
-            ""
-            "LAYOUT: "
-            "Fixed left sidebar 260px with logo at top (a blue lightning bolt SVG icon + 'Pulse' wordmark), "
-            "nav sections: MAIN (Dashboard, Analytics, Revenue), MANAGE (Users, Projects, Reports), "
-            "SYSTEM (Settings, Help). Each nav item has an SVG icon, label, and active state "
-            "with blue left border + blue text + faint blue background. Sidebar footer shows "
-            "user avatar, name 'Alex Morgan', role 'Admin', and a logout icon. "
-            "Top header: breadcrumb on left, center has a pill-shaped search bar, right has "
-            "notification bell with a red dot badge, a 'Upgrade' CTA button in gradient "
-            "(blue to violet), and avatar. "
-            ""
-            "DASHBOARD PAGE — 4 sections: "
-            ""
-            "1. KPI ROW — 4 gradient-bordered cards: "
-            "Total Revenue $847,293 (+12.5% vs last month, green), "
-            "Active Users 24,891 (+8.2%, green), "
-            "Churn Rate 2.1% (-0.4%, green — lower is better), "
-            "MRR $70,607 (+15.3%, green). "
-            "Each card: large metric value in white 32px bold, trend pill with arrow, "
-            "a small sparkline SVG (7-point line) in the bottom right corner. "
-            ""
-            "2. CHARTS ROW — two side-by-side panels: "
-            "LEFT (60% width): 'Revenue Over Time' area chart in SVG. "
-            "12 months of data, filled area with a blue-to-transparent gradient fill, "
-            "stroke line in #3b82f6, gridlines in #1e2433, x/y axis labels in #6b7280. "
-            "Animated: stroke-dashoffset draws the line on load over 1.2s. "
-            "Tooltip on mouseover showing month + value. "
-            "RIGHT (40% width): 'Traffic Sources' donut chart in SVG. "
-            "5 segments: Organic 38%, Direct 24%, Social 18%, Email 12%, Paid 8%. "
-            "Each segment a different color. Center shows total '100K visits'. "
-            "Legend below with colored dots and percentages. "
-            ""
-            "3. USERS TABLE — 'Recent Signups' with columns: "
-            "Avatar+Name, Email, Plan (Free/Pro/Enterprise as colored pills), "
-            "Joined, MRR, Status (Active/Trial/Churned pills). "
-            "10 realistic mock rows. Sortable column headers (click toggles asc/desc arrow). "
-            "Row hover highlights in #1a2235. Pagination controls below (Prev / 1 2 3 / Next). "
-            ""
-            "4. BOTTOM ROW — two panels: "
-            "LEFT: 'Top Pages' — horizontal bar chart (SVG) showing 6 pages with visit counts, "
-            "bars in blue gradient, value labels on the right. "
-            "RIGHT: 'Live Activity Feed' — scrollable list of 12 timestamped events like "
-            "'User signed up', 'Pro plan upgraded', 'Payment failed' each with a colored "
-            "icon dot and relative time ('2m ago'). New items animate in from the top. "
-            ""
-            "INTERACTIVITY: "
-            "Sidebar nav clicks switch active state and swap main content area between "
-            "Dashboard (full layout above) and placeholder screens for other pages "
-            "showing a centered icon + 'Analytics coming soon' style message. "
-            "Search bar filters the users table in real-time. "
-            "Column header clicks sort the table. "
-            "Dark/light mode toggle in header — light mode uses #f8fafc bg, white cards, "
-            "dark text — persisted in localStorage. "
-            "Notification bell click opens a dropdown panel with 3 mock notifications. "
-            "All transitions 200ms ease. Scrollbar styled dark to match theme."
+            "Create a Python module with a single function is_prime(n) that returns True if n "
+            "is prime and False otherwise. Handle edge cases for n <= 1. Include pytest tests."
+        ),
+    },
+    {
+        "tier": "small",
+        "slug": "stack_class",
+        "prompt": (
+            "Create a Python module stack.py with a Stack class that implements push, pop, peek, "
+            "is_empty, and size. pop/peek should raise IndexError on empty stack. Include tests."
+        ),
+    },
+    {
+        "tier": "small",
+        "slug": "csv_stats",
+        "prompt": (
+            "Build a Python utility that reads a CSV file and returns column-wise stats for numeric "
+            "fields: count, min, max, mean. Include tests with temp files."
+        ),
+    },
+    {
+        "tier": "medium",
+        "slug": "todo_api",
+        "prompt": (
+            "Build a FastAPI TODO API with SQLite and SQLAlchemy: create/list/update/delete todos, "
+            "mark complete, and filter by status. Include tests with TestClient."
+        ),
+    },
+    {
+        "tier": "medium",
+        "slug": "cli_calculator",
+        "prompt": (
+            "Build a Python CLI calculator app with add/subtract/multiply/divide commands, proper "
+            "argument parsing, and division-by-zero handling. Include tests."
+        ),
+    },
+    {
+        "tier": "medium",
+        "slug": "json_kv_store",
+        "prompt": (
+            "Build a small Python JSON-backed key-value store module with get/set/delete/list APIs, "
+            "atomic file writes, and tests."
         ),
     },
     {
         "tier": "large",
-        "slug": "projectflow",
+        "slug": "data_validators",
         "prompt": (
-            "Build a Python FastAPI project management API called Projectflow. "
-            "MODELS: User (id, email, hashed_password, name, created_at, is_active), "
-            "Project (id, name, description, owner_id, status active/archived, created_at), "
-            "Task (id, project_id, assignee_id, title, description, status todo/in_progress/done, "
-            "priority low/medium/high/critical, due_date, created_at, updated_at), "
-            "Comment (id, task_id, author_id, body, created_at). "
-            "ENDPOINTS: POST /auth/register, POST /auth/login returning JWT, "
-            "GET/POST /projects, GET/PUT/DELETE /projects/{id}, "
-            "GET/POST /projects/{id}/tasks, PUT/DELETE /tasks/{id}, "
-            "GET/POST /tasks/{id}/comments. "
-            "BUSINESS RULES: only project owner can archive or delete a project (403 otherwise); "
-            "overdue tasks (due_date < today and status != done) include is_overdue=true in responses; "
-            "deleting a project cascades to its tasks and comments. "
-            "TECHNICAL: FastAPI + SQLAlchemy with SQLite, async sessions; "
-            "JWT auth via python-jose, passwords hashed with passlib/bcrypt; "
-            "Pydantic v2 schemas with email validation and password min 8 chars; "
-            "src/ package layout with src/routers/, src/models/, src/schemas/, src/crud/; "
-            "top-level run.py that starts uvicorn. "
-            "TESTS in tests/ using FastAPI TestClient with fresh in-memory SQLite per session: "
-            "test registration and login flow, JWT protection returning 401 on bad token, "
-            "owner-vs-non-owner project delete returning 403, task creation and overdue flag, "
-            "comment creation and retrieval."
+            "Build a Python data-validation package for user records, orders, and product payloads "
+            "with reusable validators, clear error objects, and a CLI entrypoint. Include tests."
+        ),
+    },
+    {
+        "tier": "large",
+        "slug": "task_queue",
+        "prompt": (
+            "Create a SaaS application that provides a REST API for managing a task queue. "
+            "Use FastAPI + SQLAlchemy + SQLite. Include auth, enqueue/dequeue, retry tracking, "
+            "status transitions, and tests."
         ),
     },
 ]
@@ -132,7 +96,7 @@ def _workspace_for(slug: str) -> str:
     return os.path.join("benchmark_output", slug)
 
 
-async def run_one(entry: dict, max_heals: int = 0) -> BenchmarkResult:
+async def run_one(entry: dict, max_heals: int = 3) -> BenchmarkResult:
     slug = entry["slug"]
     tier = entry["tier"]
     prompt = entry["prompt"]
@@ -222,13 +186,17 @@ async def main():
     parser.add_argument(
         "--max-heals",
         type=int,
-        default=0,
-        help="Maximum heal iterations per run (default: 0 for faster benchmark runs)",
+        default=3,
+        help="Maximum heal iterations per run (default: 3)",
     )
     args = parser.parse_args()
 
     prompts = BENCHMARK_PROMPTS
     if args.index is not None:
+        if args.index < 0 or args.index >= len(BENCHMARK_PROMPTS):
+            raise SystemExit(
+                f"--index must be between 0 and {len(BENCHMARK_PROMPTS) - 1}, got {args.index}"
+            )
         prompts = [BENCHMARK_PROMPTS[args.index]]
     elif args.tier != "all":
         prompts = [p for p in BENCHMARK_PROMPTS if p["tier"] == args.tier]

@@ -1,11 +1,12 @@
 import ast
 import os
+import re
 import time
 import asyncio
 from pathlib import Path
 from typing import Optional
 from dataclasses import replace
-from .models import PipelineReport, TestSuite, StageTrace
+from .models import PipelineReport, TestSuite, StageTrace, HealingReport
 from .llm.router import LLMRouter
 from .utils import run_shell_command
 from .planner_architect import PlannerArchitect
@@ -21,6 +22,8 @@ from .visual_validator import VisualValidator
 from .checkpoint import CheckpointManager
 from .reporter import Reporter
 from .workspace_lock import WorkspaceLock
+from .live_guard import post_execution_guard
+from .startup_guard import detect_entry_point, build_import_check_command
 
 
 def _is_test_file(path: str) -> bool:
@@ -151,6 +154,60 @@ def _python_imported_modules(content: str, file_path: str) -> set[str]:
     return imported
 
 
+def _test_has_no_assertions(content: str) -> bool:
+    """True if any test_ function in the file has no assert, raise, or pytest.raises."""
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not node.name.startswith("test_"):
+            continue
+        has_signal = any(
+            isinstance(n, (ast.Assert, ast.Raise))
+            or (
+                isinstance(n, ast.Expr)
+                and isinstance(n.value, ast.Call)
+                and isinstance(n.value.func, ast.Attribute)
+                and n.value.func.attr in {"raises", "fail", "assertRaises", "warns"}
+            )
+            for n in ast.walk(node)
+        )
+        if not has_signal:
+            return True
+    return False
+
+
+def _infer_validation_commands(generated_files) -> list[str]:
+    """Infer reasonable validation commands from file extensions when none are specified."""
+    exts: set[str] = set()
+    top_level: set[str] = set()
+    for f in generated_files:
+        exts.add(os.path.splitext(f.file_path)[1].lower())
+        if "/" not in f.file_path.replace("\\", "/"):
+            top_level.add(f.file_path.lower())
+
+    cmds: list[str] = []
+    if ".py" in exts:
+        cmds.append("pytest --tb=short -q")
+    if exts & {".js", ".ts", ".tsx", ".jsx", ".mjs", ".cjs"}:
+        if "package.json" in top_level:
+            cmds.append("npm test --if-present")
+        else:
+            cmds.append("node --test")
+    if ".go" in exts:
+        cmds.append("go test ./...")
+    if ".rs" in exts:
+        cmds.append("cargo test")
+    if ".rb" in exts:
+        cmds.append("bundle exec rspec --format progress")
+    if ".php" in exts:
+        cmds.append("./vendor/bin/phpunit")
+    return cmds
+
+
 def _tests_need_regeneration(generated_files) -> bool:
     suspicious_phrases = (
         "cannot inspect",
@@ -173,6 +230,9 @@ def _tests_need_regeneration(generated_files) -> bool:
         lower = f.content.lower()
         if any(phrase in lower for phrase in suspicious_phrases):
             return True
+        # TestIntegrityGuard: reject tests whose functions have no assertions
+        if _test_has_no_assertions(f.content):
+            return True
         imported = _python_imported_modules(f.content, f.file_path)
         if not imported:
             return True
@@ -193,6 +253,7 @@ def _collect_python_consistency_issues(generated_files) -> dict[str, list[str]]:
     ]
     module_to_path: dict[str, str] = {}
     module_to_exports: dict[str, set[str]] = {}
+    module_parse_failed: set[str] = set()
     ast_trees: dict[str, ast.AST] = {}
     issues: dict[str, list[str]] = {}
 
@@ -206,6 +267,8 @@ def _collect_python_consistency_issues(generated_files) -> dict[str, list[str]]:
             issues.setdefault(f.file_path, []).append(
                 f"Syntax error blocks imports: line {exc.lineno}: {exc.msg}"
             )
+            if module_name:
+                module_parse_failed.add(module_name)
             continue
         ast_trees[f.file_path] = tree
         if module_name:
@@ -242,6 +305,10 @@ def _collect_python_consistency_issues(generated_files) -> dict[str, list[str]]:
                     )
                 if not target_module or not _looks_internal(target_module):
                     continue
+                # If the module exists but has syntax errors, avoid cascading false
+                # "missing module/symbol" issues that strip valid imports.
+                if target_module in module_parse_failed:
+                    continue
                 if target_module not in module_to_exports:
                     issues.setdefault(f.file_path, []).append(
                         f"Imports from missing internal module '{target_module}'."
@@ -265,6 +332,94 @@ def _collect_python_consistency_issues(generated_files) -> dict[str, list[str]]:
                 deduped.append(msg)
         issues[file_path] = deduped
     return issues
+
+
+def _internal_module_exists(workspace: str, module_name: str) -> bool:
+    if not module_name:
+        return False
+    module_rel = Path(*module_name.split("."))
+    py_file = (Path(workspace) / module_rel).with_suffix(".py")
+    pkg_init = Path(workspace) / module_rel / "__init__.py"
+    return py_file.exists() or pkg_init.exists()
+
+
+def _fix_missing_import_symbols(
+    issues: dict[str, list[str]],
+    workspace: str,
+) -> list[str]:
+    """Deterministically remove missing imported symbols from Python files.
+
+    Handles two issue patterns produced by _collect_python_consistency_issues:
+      - "Imports missing symbol 'X' from 'Y'" → remove X from the from-import line
+      - "Imports from missing internal module 'Y'" → remove the entire import line
+
+    Requires no LLM call — safe to run at max_heals=0. Returns fixed file paths.
+    """
+    fixed: list[str] = []
+    for file_path, msgs in issues.items():
+        full_path = Path(workspace) / file_path
+        if not full_path.exists():
+            continue
+
+        # Collect what to remove for this file
+        bad_symbols: set[str] = set()       # individual symbol names
+        bad_mod_parts: set[str] = set()     # last component of missing module paths
+
+        for msg in msgs:
+            m = re.match(r"Imports missing symbol '([^']+)' from '", msg)
+            if m:
+                bad_symbols.add(m.group(1))
+                continue
+            m = re.match(r"Imports from missing internal module '([^']+)'", msg)
+            if m:
+                missing_module = m.group(1)
+                # Safety: if a module file exists on disk, don't strip imports.
+                # It may simply be temporarily unparsable and will be healed later.
+                if _internal_module_exists(workspace, missing_module):
+                    continue
+                # Use the last dotted component so both absolute and relative
+                # import forms can be matched (e.g. 'src.auth' → 'auth').
+                bad_mod_parts.add(missing_module.split(".")[-1])
+
+        if not bad_symbols and not bad_mod_parts:
+            continue
+
+        lines = full_path.read_text(encoding="utf-8").split("\n")
+        new_lines: list[str] = []
+
+        for line in lines:
+            from_m = re.match(r'^(from\s+(\S+)\s+import\s+)(.+)$', line)
+            if not from_m:
+                new_lines.append(line)
+                continue
+
+            import_prefix = from_m.group(1)   # "from ..auth import "
+            from_module   = from_m.group(2)   # "..auth" or "src.auth"
+            names_str     = from_m.group(3)   # "authenticate_user, create_access_token"
+
+            # Check if the whole import line should be dropped (missing module)
+            mod_components = set(re.split(r'[\.\s]+', from_module))
+            if mod_components & bad_mod_parts:
+                continue  # drop the entire line
+
+            # Remove individual bad symbols from the name list
+            names = [n.strip() for n in names_str.split(",") if n.strip()]
+            kept  = [n for n in names if n not in bad_symbols]
+
+            if not kept:
+                continue  # all names were bad → drop the line
+            if len(kept) == len(names):
+                new_lines.append(line)  # nothing changed
+            else:
+                new_lines.append(import_prefix + ", ".join(kept))
+
+        new_content = "\n".join(new_lines)
+        original    = "\n".join(lines)
+        if new_content != original:
+            full_path.write_text(new_content, encoding="utf-8")
+            fixed.append(file_path)
+
+    return fixed
 
 
 async def _test_suite_from_executor_files(test_writer: TestWriter, generated_files) -> TestSuite:
@@ -295,6 +450,7 @@ class Orchestrator:
             report = PipelineReport(prompt=prompt)
         # Carry forward any traces from a resumed checkpoint; accumulate new ones here
         traces: list[StageTrace] = list(report.stage_traces)
+        _micro_heal_attempts: list = []
         _lock = WorkspaceLock(self.workspace)
         if not _lock.acquire():
             raise RuntimeError(
@@ -371,6 +527,57 @@ class Orchestrator:
                     start_unix_ts=_tw0, end_unix_ts=_tw0 + (_t1 - _t0),
                     prompt_chars=0, response_chars=0,
                 ))
+
+            # ── LiveGuard Tier 2: Post-execution micro-heal ─────────────────────────
+            # Fires after all files are written, before deps/tests. Deterministic-first,
+            # then capped LLM micro-heals. Keeps Stage 6 as the final safety net.
+            # Guard: skip on any resume where Stage 6 has already run to avoid
+            # re-editing healed files and introducing nondeterministic behaviour.
+            if (
+                report.execution_result
+                and report.execution_result.generated_files
+                and not report.healing_report
+            ):
+                _t0_mg = time.monotonic()
+                print("LiveGuard: Post-execution integrity check...")
+                _healer_mg = Healer(
+                    self.router.get_client_for_role("healer"),
+                    self.workspace,
+                    max_attempts=1,  # micro-heal only — Stage 6 does full healing
+                )
+                _lg_max_env = os.environ.get("CODEGEN_LIVE_GUARD_MAX_LLM", "10").strip()
+                _lg_max_llm = int(_lg_max_env) if _lg_max_env.lstrip("-").isdigit() else 10
+                _micro_heal_attempts = await post_execution_guard(
+                    report.execution_result.generated_files,
+                    self.workspace,
+                    _healer_mg,
+                    max_llm_calls=_lg_max_llm,
+                )
+                print(
+                    f"  [LiveGuard] Done in {time.monotonic() - _t0_mg:.1f}s "
+                    f"({len(_micro_heal_attempts)} LLM micro-heal(s))"
+                )
+                # Refresh in-memory GeneratedFile.content for any file that LiveGuard
+                # modified on disk (deterministic or LLM), so downstream stages
+                # (test-gen, Stage 6 consistency checks) see the updated source.
+                _refreshed: list = []
+                _any_refreshed = False
+                for _gf in report.execution_result.generated_files:
+                    _disk = Path(self.workspace) / _gf.file_path
+                    if _disk.exists():
+                        _new_content = _disk.read_text(encoding="utf-8")
+                        if _new_content != _gf.content:
+                            _refreshed.append(replace(_gf, content=_new_content))
+                            _any_refreshed = True
+                            continue
+                    _refreshed.append(_gf)
+                if _any_refreshed:
+                    report = replace(
+                        report,
+                        execution_result=replace(
+                            report.execution_result, generated_files=_refreshed
+                        ),
+                    )
 
             # ── Stages 4+5: DEPENDENCIES + TESTS (parallel) ─────────────────────────
             # Both depend only on execution_result; neither depends on the other.
@@ -479,54 +686,107 @@ class Orchestrator:
                     self.workspace,
                     max_attempts=max_heals,
                 )
-                _validation_cmds = (
+                _validation_cmds = list(
                     report.test_suite.validation_commands if report.test_suite else []
                 )
+                # ── ValidationCommandGuard: infer commands when none specified ────
+                # Prevents silent skip of Stage 6 on projects where the architect
+                # omitted validation commands and TestWriter produced no suite.
+                if not _validation_cmds and report.execution_result:
+                    _inferred = _infer_validation_commands(
+                        report.execution_result.generated_files
+                    )
+                    if _inferred:
+                        print(
+                            f"  [ValidationCommandGuard] No validation commands found."
+                            f" Inferred from stack: {_inferred}"
+                        )
+                        _validation_cmds = _inferred
+                # ── StartupLifespanGuard: inject import smoke-check ──────────────
+                # Runs `python -c "import <entry_point>"` before pytest so import
+                # errors and module-level TypeErrors surface as concrete healer
+                # input rather than being buried in a pytest collection failure.
+                _entry_point = detect_entry_point(
+                    report.execution_result.generated_files, self.workspace
+                )
+                if _entry_point:
+                    _import_cmd = build_import_check_command(_entry_point)
+                    _validation_cmds = [_import_cmd] + _validation_cmds
+                    print(f"  [StartupGuard] Import smoke-check: {_import_cmd}")
                 static_attempts = []
 
-                # Static consistency fixes burn an LLM call per file — only worthwhile
-                # when (a) there is heal budget and (b) tests are actually failing.
-                # Pre-flight run costs only a subprocess; avoids wasted LLM calls on
-                # already-passing code or when the user set max_heals=0 (benchmark mode).
-                if max_heals > 0:
-                    _static_needed = True
-                    if _validation_cmds:
-                        _pre_results = await asyncio.gather(
-                            *[asyncio.to_thread(run_shell_command, cmd, cwd=self.workspace)
-                              for cmd in _validation_cmds]
+                # ── Step 1: Deterministic import cleanup (no LLM, always runs) ──────
+                # Removes dead/missing symbol imports found by static analysis.
+                # Free to run even at max_heals=0 — no LLM cost, instant, safe.
+                _det_issues = _collect_python_consistency_issues(
+                    report.execution_result.generated_files
+                )
+                if _det_issues:
+                    _det_fixed = _fix_missing_import_symbols(_det_issues, self.workspace)
+                    if _det_fixed:
+                        print(
+                            f"  [Orchestrator] Deterministic import fix applied to"
+                            f" {len(_det_fixed)} file(s): {', '.join(_det_fixed)}"
                         )
-                        if all(r.exit_code == 0 for r in _pre_results):
-                            _static_needed = False
-                            print(
-                                "  [Orchestrator] Pre-heal test run: all tests pass"
-                                " — skipping static consistency checks."
-                            )
-                    if _static_needed:
-                        consistency_issues = _collect_python_consistency_issues(
-                            report.execution_result.generated_files
-                        )
-                        if consistency_issues:
-                            for fp, msgs in list(consistency_issues.items())[:5]:
-                                print(f"  [Orchestrator] Static issue in {fp!r}: {msgs[0]}")
-                            if len(consistency_issues) > 5:
-                                print(
-                                    f"  [Orchestrator] ... and {len(consistency_issues) - 5}"
-                                    " more file(s) with issues."
-                                )
-                            print(
-                                "  [Orchestrator] Applying targeted source fixes"
-                                " before test healing."
-                            )
-                            static_attempts = await healer.heal_static_issues(
-                                consistency_issues, attempt_number=0
-                            )
 
-                healing_report = await healer.heal(_validation_cmds)
+                # ── Step 2: Pre-flight + LLM static fixes ───────────────────────────
+                # Pre-flight always runs when validation commands exist — regardless
+                # of max_heals. This gives accurate success reporting even at
+                # max_heals=0 (previously always returned success=False) and enables
+                # the short-circuit for every caller, not just max_heals > 0.
+                _preflight_all_passed = False
+                _pre_results: list = []
+                if _validation_cmds:
+                    _pre_results = await asyncio.gather(
+                        *[asyncio.to_thread(run_shell_command, cmd, cwd=self.workspace)
+                          for cmd in _validation_cmds]
+                    )
+                    if all(r.exit_code == 0 for r in _pre_results):
+                        _preflight_all_passed = True
+                        print(
+                            "  [Orchestrator] Pre-heal test run: all tests pass"
+                            " — skipping heal loop."
+                        )
+
+                # LLM static fixes: only when there is budget AND tests failed.
+                if max_heals > 0 and not _preflight_all_passed:
+                    consistency_issues = _collect_python_consistency_issues(
+                        report.execution_result.generated_files
+                    )
+                    if consistency_issues:
+                        for fp, msgs in list(consistency_issues.items())[:5]:
+                            print(f"  [Orchestrator] Static issue in {fp!r}: {msgs[0]}")
+                        if len(consistency_issues) > 5:
+                            print(
+                                f"  [Orchestrator] ... and {len(consistency_issues) - 5}"
+                                " more file(s) with issues."
+                            )
+                        print(
+                            "  [Orchestrator] Applying targeted source fixes"
+                            " before test healing."
+                        )
+                        static_attempts = await healer.heal_static_issues(
+                            consistency_issues, attempt_number=0
+                        )
+
+                # Short-circuit: pre-flight confirmed all tests pass — build a
+                # success report directly so healer.heal() doesn't re-run the
+                # test suite. Applies at any max_heals value.
+                if _preflight_all_passed:
+                    healing_report = HealingReport(
+                        success=True,
+                        attempts=[],
+                        final_command_result=_pre_results[-1] if _pre_results else None,
+                    )
+                    report = replace(report, first_pass_success=True)
+                else:
+                    healing_report = await healer.heal(_validation_cmds)
                 _t1 = time.monotonic()
-                if static_attempts:
+                all_pre_attempts = _micro_heal_attempts + static_attempts
+                if all_pre_attempts:
                     healing_report = replace(
                         healing_report,
-                        attempts=static_attempts + healing_report.attempts,
+                        attempts=all_pre_attempts + healing_report.attempts,
                     )
                 report = replace(report, healing_report=healing_report)
                 await _save(report)

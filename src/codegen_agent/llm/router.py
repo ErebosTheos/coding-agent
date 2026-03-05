@@ -84,10 +84,16 @@ class _RetryingLLMClient:
         role: str,
         fallback: Optional[LLMClient] = None,
         max_retries: int = 2,
+        call_primary: Optional[LLMClient] = None,
+        call_fallback: Optional[LLMClient] = None,
     ):
+        # Keep raw clients for introspection/debugging.
         self._primary = primary
         self._role = role
         self._fallback = fallback
+        # Runtime call clients may include wrappers (cache, tracing, etc.).
+        self._primary_client = call_primary or primary
+        self._fallback_client = call_fallback or fallback
         self._max_retries = max_retries
 
     async def generate(self, prompt: str, system_prompt: str = "") -> str:
@@ -95,7 +101,7 @@ class _RetryingLLMClient:
 
         for attempt in range(self._max_retries + 1):
             try:
-                response = await self._primary.generate(prompt, system_prompt=system_prompt)
+                response = await self._primary_client.generate(prompt, system_prompt=system_prompt)
                 if not response or not response.strip():
                     raise LLMError(f"Empty response from role '{self._role}' on attempt {attempt + 1}")
                 return response
@@ -113,9 +119,9 @@ class _RetryingLLMClient:
                 else:
                     break
 
-        if self._fallback is not None:
+        if self._fallback_client is not None:
             try:
-                response = await self._fallback.generate(prompt, system_prompt=system_prompt)
+                response = await self._fallback_client.generate(prompt, system_prompt=system_prompt)
                 if response and response.strip():
                     return response
             except Exception:
@@ -126,8 +132,30 @@ class _RetryingLLMClient:
         ) from last_exc
 
     async def astream(self, prompt: str, system_prompt: str = ""):
-        async for chunk in self._primary.astream(prompt, system_prompt=system_prompt):
-            yield chunk
+        last_exc: Optional[Exception] = None
+        for attempt in range(2):
+            yielded_any = False
+            try:
+                async for chunk in self._primary_client.astream(prompt, system_prompt=system_prompt):
+                    yielded_any = True
+                    yield chunk
+                return
+            except (LLMTimeoutError, LLMError) as exc:
+                last_exc = exc
+                if yielded_any:
+                    raise  # mid-stream failure — can't safely retry
+                if attempt == 0:
+                    await asyncio.sleep(1.0)
+        if self._fallback_client is not None:
+            try:
+                async for chunk in self._fallback_client.astream(prompt, system_prompt=system_prompt):
+                    yield chunk
+                return
+            except Exception:
+                pass
+        raise LLMError(
+            f"Role '{self._role}' astream failed after retry: {last_exc}"
+        ) from last_exc
 
 
 class LLMRouter:
@@ -190,15 +218,20 @@ class LLMRouter:
 
         if client_key not in self._clients:
             raw = self._create_client(provider, model)
+            fallback_raw = self._get_fallback_client(role)
             if use_cache:
                 cache_dir = os.path.join(".codegen_agent", "llm_cache")
                 cache = LLMCache(cache_dir)
-                client: LLMClient = CachingLLMClient(raw, cache, provider, model)
+                call_client: LLMClient = CachingLLMClient(raw, cache, provider, model)
             else:
-                client = raw
-            if not isinstance(client, _RetryingLLMClient):
-                fallback = self._get_fallback_client(role)
-                client = _RetryingLLMClient(client, role, fallback=fallback)
+                call_client = raw
+            client = _RetryingLLMClient(
+                primary=raw,
+                role=role,
+                fallback=fallback_raw,
+                call_primary=call_client,
+                call_fallback=fallback_raw,
+            )
             self._clients[client_key] = client
 
         return self._clients[client_key]

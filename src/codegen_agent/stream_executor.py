@@ -193,9 +193,20 @@ class StreamingPlanArchExecutor:
             f"{len(architecture.nodes)} node(s). Executing (stream-bulk)..."
         )
 
-        # ── Phase 2: Stream-bulk execution ──────────────────────────────────
-        # One LLM call for all files; files written as their JSON values arrive.
-        # Falls back to wave-based if the stream produces incomplete JSON.
-        exec_result = await self.executor._stream_bulk(architecture)
+        # ── Phase 2: Execution strategy ─────────────────────────────────────
+        # Respect executor bulk threshold. This avoids one giant prompt for
+        # medium/large projects when max_bulk_files is lowered (or disabled).
+        bulk_limit = getattr(self.executor, "max_bulk_files", 20)
+        use_stream_bulk = bulk_limit > 0 and len(architecture.nodes) <= bulk_limit
+
+        if use_stream_bulk:
+            # One LLM call for all files; files written as JSON values arrive.
+            exec_result = await self.executor._stream_bulk(architecture)
+        else:
+            # Defer to normal executor strategy (wave-based when bulk is disabled).
+            exec_result = await self.executor.execute(architecture)
+        if hasattr(self.executor, "workspace"):
+            from .executor import _ensure_language_boilerplate
+            _ensure_language_boilerplate(self.executor.workspace, exec_result.generated_files)
 
         return plan, architecture, exec_result

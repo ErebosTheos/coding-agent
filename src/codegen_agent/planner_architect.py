@@ -23,7 +23,7 @@ Given a user request, return a single JSON object with exactly two keys: "plan" 
     "file_path": string,
     "purpose": string,
     "depends_on": [string],
-    "contract": {"purpose": string, "inputs": [], "outputs": [], "public_api": [], "invariants": []}
+    "contract": {"purpose": string, "inputs": [], "outputs": [], "public_api": ["ClassName", "function_name", "CONSTANT"], "invariants": []}
   }],
   "global_validation_commands": [string]
   // Shell commands that fully validate the project — must match the tech stack exactly.
@@ -42,12 +42,30 @@ Given a user request, return a single JSON object with exactly two keys: "plan" 
 }
 
 ARCHITECTURE RULES:
-- ALWAYS include a dependency manifest in file_tree and nodes: requirements.txt for Python,
-  package.json for Node, go.mod for Go, Cargo.toml for Rust, composer.json for PHP.
-- For web apps (FastAPI, Flask, Express, etc.) whose source lives inside src/, ALWAYS include
-  a top-level entry point file (run.py for Python, index.js for Node) in the file_tree and
-  nodes so users can start the server with `python run.py` or `node index.js`.
+- CRITICAL: For every node's contract.public_api, list the ACTUAL exported names (classes,
+  functions, constants, types) that other files will import from this file. Do NOT leave
+  public_api as an empty list — a populated public_api is the source of truth for import
+  statements the executor will write. Example for a models file:
+  "public_api": ["User", "Task", "Base", "get_db"]
+- ALWAYS include the language dependency manifest as a node:
+    Python   → requirements.txt
+    Node/TS  → package.json  (include "scripts": {"start": ..., "test": ...})
+    Go       → go.mod
+    Rust     → Cargo.toml
+    PHP      → composer.json
+    Ruby     → Gemfile
+  If the project has no dependencies yet, still include the manifest with minimal content.
+- For web apps (FastAPI, Flask, Express, etc.) whose source lives inside a sub-directory,
+  ALWAYS include a top-level entry point file (run.py for Python, index.js/server.js for Node)
+  so users can start the server without knowing the internal package structure.
 - Do NOT create directory placeholder nodes (e.g. node_id for "src/"). Only list real files.
+- Python only: ALWAYS include an __init__.py node for every package directory
+  (e.g. src/__init__.py, src/routers/__init__.py). These are required for imports to resolve.
+- FastAPI + SQLAlchemy async projects:
+  - Ensure session setup uses `async_sessionmaker(..., expire_on_commit=False)`.
+  - API paths that serialize related ORM fields must plan eager-loading queries
+    (e.g. `selectinload`) rather than relying on lazy loading at response time.
+  - Avoid patterns that trigger runtime `MissingGreenlet` during response serialization.
 
 Respond ONLY with the raw JSON object. No markdown fences, no commentary."""
 

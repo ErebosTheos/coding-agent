@@ -163,18 +163,22 @@ class GeminiCLIClient(LLMClient):
             )
             assert process.stdout is not None
             loop = asyncio.get_running_loop()
-            deadline = loop.time() + self.timeout_seconds
+            stream_timeout = int(os.environ.get(
+                "CODEGEN_LLM_STREAM_MAX_TIMEOUT",
+                os.environ.get("CODEGEN_LLM_TIMEOUT", str(self.timeout_seconds)),
+            ))
+            deadline = loop.time() + stream_timeout
 
             while True:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
                     process.kill()
-                    raise LLMTimeoutError(f"Gemini CLI stream timed out after {self.timeout_seconds}s")
+                    raise LLMTimeoutError(f"Gemini CLI stream timed out after {stream_timeout}s")
                 try:
                     chunk = await asyncio.wait_for(process.stdout.read(4096), timeout=remaining)
                 except asyncio.TimeoutError:
                     process.kill()
-                    raise LLMTimeoutError(f"Gemini CLI stream timed out after {self.timeout_seconds}s")
+                    raise LLMTimeoutError(f"Gemini CLI stream timed out after {stream_timeout}s")
                 if not chunk:
                     break
                 yield chunk.decode()

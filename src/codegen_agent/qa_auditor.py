@@ -1,31 +1,63 @@
+import asyncio
 import json
 import os
 import re
 from pathlib import Path
+from typing import Awaitable, Callable
 from .models import QAReport, PipelineReport
 from .llm.protocol import LLMClient
 from .utils import find_json_in_text, prune_prompt
 
-QA_SYSTEM_PROMPT = """You are an expert QA Auditor and Senior Developer.
-Your goal is to audit a completed software project and provide a quality report in JSON format.
-Use ONLY the provided evidence snapshot as ground truth.
+# Deterministic anti-pattern checks for fast per-file scan
+_ANTIPATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r'datetime\.utcnow\(\)'), "datetime.utcnow() is deprecated — use datetime.now(timezone.utc)"),
+    (re.compile(r'(?<!\w)sessionmaker\('), "ORM sessionmaker detected — use async_sessionmaker for async code"),
+    (re.compile(r'AsyncClient\(app='), "httpx.AsyncClient(app=...) deprecated — use ASGITransport"),
+    (re.compile(r'@app\.on_event\('), "@app.on_event deprecated — use lifespan context manager"),
+    (re.compile(r'SECRET_KEY\s*=\s*["\'][^"\']{4,}["\']'), "Possible hardcoded SECRET_KEY in source"),
+    (re.compile(r'password\s*=\s*["\'][^"\']{3,}["\']'), "Possible hardcoded password in source"),
+]
+
+QA_SYSTEM_PROMPT = """You are a Senior Software Engineer performing a real code review.
+You have been given the actual source code. Read it carefully and find real bugs.
+
+Review the code for:
+1. CORRECTNESS — Does the implementation match what was requested? Is every planned feature present?
+2. BUGS — Import errors (functions called but not imported), NameErrors, missing None-checks,
+   unhandled exceptions, logic errors, broken API routes, wrong HTTP methods.
+3. SECURITY — Hardcoded secrets or insecure fallbacks, missing auth guards on protected endpoints,
+   leaked sensitive fields (passwords/tokens in API responses), missing input validation.
+4. COMPLETENESS — Are all planned API endpoints implemented? Do all routers have the right routes?
+   Are all features from the spec present in the code?
+5. TESTS — Do test files import and exercise the real source modules? Do tests have assertions?
+
+Scoring (start at 100, deduct):
+- Critical bug that crashes the app or exposes a security hole: -20 to -30 points each
+- Missing feature from the spec or broken endpoint: -10 to -15 points each
+- Logic bug or missing guard: -5 to -10 points each
+- Minor issue: -2 to -5 points each
+
 Hard rules:
-- Do not report a file as missing if it appears in known_files or workspace_files_sample.
-- Do not claim a validation command failed when validation.healing_success is true
-  and validation.last_failed_command is null.
-- If evidence is ambiguous, place it in suggestions, not issues.
-The report must include:
-- score: A number from 0 to 100.
-- issues: A list of identified bugs or poor practices (strings).
-- suggestions: A list of improvements (strings).
-- approved: A boolean indicating if the project is ready for delivery.
+- Do NOT report a file as missing if it appears in known_files.
+- Do NOT penalise for linting tools (ruff, black, flake8).
+- healing_success=false with healing_attempts=0 means healing was skipped, NOT that tests failed.
+- Be specific: name the file and the exact line or pattern that has the issue.
+- If the code compiles and tests pass (healing_success=true, no last_failed_command),
+  start your review from 80 and deduct only for real issues you find in the source.
 
-Respond ONLY with the JSON block."""
+Return ONLY a JSON object:
+{"score": <0-100>, "issues": ["<specific issue>", ...], "suggestions": ["<improvement>", ...], "approved": <true|false>}"""
 
-QA_USER_PROMPT_TEMPLATE = """Project Summary:
+QA_USER_PROMPT_TEMPLATE = """Original request:
+{original_prompt}
+
+Project summary:
 {pipeline_summary}
 
-Audit the project and provide a report."""
+Source code to review:
+{source_code}
+
+Review the source code above and return a JSON quality report."""
 
 _IGNORED_QA_DIRS = {
     ".codegen_agent",
@@ -96,17 +128,27 @@ class QAAuditor:
         }
 
     @staticmethod
+    def _filter_lint_commands(commands: list) -> list:
+        """Remove pure linting/formatting commands that are not functional tests."""
+        _LINT_PREFIXES = ("ruff", "black", "flake8", "isort", "pylint", "mypy", "pyflakes")
+        return [
+            cmd for cmd in (commands or [])
+            if not any(cmd.strip().startswith(p) for p in _LINT_PREFIXES)
+        ]
+
+    @staticmethod
     def _validation_evidence(report: PipelineReport) -> dict:
         healing = report.healing_report
         final = healing.final_command_result if healing else None
+        raw_cmds = (
+            report.test_suite.validation_commands
+            if report.test_suite else (
+                report.architecture.global_validation_commands
+                if report.architecture else []
+            )
+        )
         return {
-            "declared_commands": (
-                report.test_suite.validation_commands
-                if report.test_suite else (
-                    report.architecture.global_validation_commands
-                    if report.architecture else []
-                )
-            ),
+            "declared_commands": QAAuditor._filter_lint_commands(raw_cmds),
             "healing_success": healing.success if healing else False,
             "healing_attempts": len(healing.attempts) if healing else 0,
             "blocked_reason": healing.blocked_reason if healing else None,
@@ -148,7 +190,7 @@ class QAAuditor:
                 "file_count": len(file_tree),
                 "files_sample": file_tree[:50],
                 "node_count": len(nodes),
-                "validation_commands": report.architecture.global_validation_commands if report.architecture else [],
+                "validation_commands": self._filter_lint_commands(report.architecture.global_validation_commands if report.architecture else []),
             },
             "execution": {
                 "success": report.execution_result is not None,
@@ -160,7 +202,7 @@ class QAAuditor:
                 "framework": report.test_suite.framework if report.test_suite else None,
                 "test_file_count": len(test_files),
                 "test_files_sample": test_files[:20],
-                "validation_commands": report.test_suite.validation_commands if report.test_suite else [],
+                "validation_commands": self._filter_lint_commands(report.test_suite.validation_commands if report.test_suite else []),
             },
             "healing": {
                 "success": report.healing_report.success if report.healing_report else False,
@@ -214,6 +256,14 @@ class QAAuditor:
                 if any(path in known_files for path in paths):
                     continue
 
+            # Always drop issues that are purely about linting tools
+            mentions_lint_failure = any(
+                token in lower
+                for token in ("ruff check", "ruff ", "black ", "flake8", "isort", "pylint")
+            )
+            if mentions_lint_failure:
+                continue
+
             mentions_command_failure = any(
                 token in lower
                 for token in (
@@ -221,7 +271,6 @@ class QAAuditor:
                     "validation commands fail",
                     "does not pass",
                     "fails with",
-                    "ruff check",
                     "pytest",
                 )
             )
@@ -250,9 +299,6 @@ class QAAuditor:
 
         approved_raw = data.get("approved", False)
         approved = bool(approved_raw)
-        if not issues and validation.get("healing_success") and not validation.get("blocked_reason"):
-            approved = True
-            score = max(score, 85.0)
 
         return {
             "score": score,
@@ -261,13 +307,103 @@ class QAAuditor:
             "approved": approved,
         }
 
+    def _read_source_files(self, report: PipelineReport, max_chars: int = 16_000) -> str:
+        """Read actual source file contents for the QA LLM to review.
+
+        Prioritises source files over test files, skips binary/config/asset files.
+        Caps total chars so the prompt stays within token budget.
+        """
+        _CODE_EXTS = {".py", ".js", ".ts", ".tsx", ".go", ".rs", ".php", ".rb"}
+        _SKIP_NAMES = {
+            "requirements.txt", "package-lock.json", "go.sum",
+            "__init__.py", ".gitignore", "README.md",
+        }
+        generated = report.execution_result.generated_files if report.execution_result else []
+        test_files = set(report.test_suite.test_files.keys()) if report.test_suite else set()
+
+        # Source files first, then test files, skip tiny/empty/config
+        ordered = sorted(
+            generated,
+            key=lambda f: (f.file_path in test_files, f.file_path),
+        )
+
+        parts: list[str] = []
+        total = 0
+        for gf in ordered:
+            if os.path.basename(gf.file_path) in _SKIP_NAMES:
+                continue
+            if os.path.splitext(gf.file_path)[1].lower() not in _CODE_EXTS:
+                continue
+            # Read current on-disk content (may have been healed since execution)
+            disk_path = Path(self.workspace) / gf.file_path
+            try:
+                content = disk_path.read_text(encoding="utf-8", errors="replace") if disk_path.exists() else gf.content
+            except OSError:
+                content = gf.content
+            if not content.strip():
+                continue
+            entry = f"=== {gf.file_path} ===\n{content.strip()}"
+            if total + len(entry) > max_chars:
+                remaining = max_chars - total
+                if remaining > 200:
+                    parts.append(entry[:remaining] + "\n[... truncated ...]")
+                break
+            parts.append(entry)
+            total += len(entry)
+
+        return "\n\n".join(parts) if parts else "(no source files available)"
+
+    def _quick_file_check(self, file_path: str, content: str) -> dict:
+        """Fast deterministic scan — no LLM, instant per-file feedback."""
+        issues: list[str] = []
+        for pattern, msg in _ANTIPATTERNS:
+            if pattern.search(content):
+                issues.append(msg)
+        return {
+            "file": file_path,
+            "issues": issues,
+            "clean": len(issues) == 0,
+            "lines": content.count("\n") + 1,
+        }
+
+    async def audit_streaming(
+        self,
+        report: PipelineReport,
+        on_file_reviewed: Callable[[str, dict], Awaitable[None]] | None = None,
+    ) -> QAReport:
+        """Phase 1: fast deterministic per-file scan (publishes events as each file is checked).
+        Phase 2: full LLM batch audit for final score and deep issues."""
+        _CODE_EXTS = {".py", ".js", ".ts", ".tsx", ".go", ".rs", ".php", ".rb"}
+        generated = report.execution_result.generated_files if report.execution_result else []
+
+        for gf in generated:
+            if os.path.splitext(gf.file_path)[1].lower() not in _CODE_EXTS:
+                continue
+            disk_path = Path(self.workspace) / gf.file_path
+            try:
+                content = disk_path.read_text(encoding="utf-8", errors="replace") if disk_path.exists() else (gf.content or "")
+            except OSError:
+                content = gf.content or ""
+            result = self._quick_file_check(gf.file_path, content)
+            if on_file_reviewed:
+                await on_file_reviewed(gf.file_path, result)
+            await asyncio.sleep(0)  # yield to event loop between files
+
+        # Full LLM audit for final scored report
+        return await self.audit(report)
+
     async def audit(self, report: PipelineReport) -> QAReport:
-        """Audits the project and generates a QA report."""
+        """Audits the project by reading actual source code and generating a QA report."""
         summary = self._build_summary(report)
-        user_prompt = QA_USER_PROMPT_TEMPLATE.format(pipeline_summary=json.dumps(summary, indent=2))
-        user_prompt = prune_prompt(user_prompt, max_chars=12_000)
+        source_code = self._read_source_files(report, max_chars=18_000)
+        user_prompt = QA_USER_PROMPT_TEMPLATE.format(
+            original_prompt=report.prompt[-1_000:],
+            pipeline_summary=json.dumps(summary, indent=2),
+            source_code=source_code,
+        )
+        user_prompt = prune_prompt(user_prompt, max_chars=28_000)
         response = await self.llm_client.generate(user_prompt, system_prompt=QA_SYSTEM_PROMPT)
-        
+
         data = find_json_in_text(response)
         if not data or not isinstance(data, dict):
             raise ValueError(f"Failed to extract JSON from QA response: {response}")

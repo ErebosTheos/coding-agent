@@ -13,7 +13,14 @@ The architecture must include:
     - purpose: Brief description of the file's role.
     - depends_on: List of node_ids this file depends on.
     - contract: An object with purpose, inputs, outputs, public_api, and invariants.
+      CRITICAL: public_api must list every class, function, and constant that other files
+      will import from this file. Do NOT leave public_api as an empty list.
+      Example: "public_api": ["UserModel", "TaskModel", "Base", "get_db"]
 - global_validation_commands: A list of shell commands to validate the entire project (e.g., linting, type checking).
+- For FastAPI + SQLAlchemy async projects:
+    - Ensure session setup uses `async_sessionmaker(..., expire_on_commit=False)`.
+    - Plan eager-loading (`selectinload`) for API responses that include related ORM data.
+    - Avoid lazy-load response serialization patterns that trigger MissingGreenlet.
 
 Respond ONLY with the JSON block."""
 

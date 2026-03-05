@@ -10,3 +10,6 @@ build/
 benchmark_output/
 test_output/
 Legacy*/
+Fully Autonomous/
+.codegen_agent/
+.claude/

@@ -32,6 +32,21 @@ def test_collect_python_consistency_issues_detects_missing_module():
     assert any("missing internal module" in msg for msg in issues["app/main.py"])
 
 
+def test_collect_python_consistency_issues_avoids_cascade_when_target_has_syntax_error():
+    files = [
+        _gf("app/core.py", "def broken(:\n", "core"),
+        _gf("app/main.py", "from app.core import deps\n", "main"),
+    ]
+
+    issues = _collect_python_consistency_issues(files)
+
+    # We should report the real syntax error, but avoid a false
+    # missing-symbol/missing-module issue in importers.
+    assert "app/core.py" in issues
+    assert any("Syntax error blocks imports" in msg for msg in issues["app/core.py"])
+    assert "app/main.py" not in issues
+
+
 def test_tests_need_regeneration_for_hypothetical_mock_tests():
     files = [
         _gf("app/logic.py", "def add(a, b):\n    return a + b\n", "logic"),

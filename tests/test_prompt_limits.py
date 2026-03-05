@@ -20,11 +20,11 @@ def test_cap_file_content_short_unchanged():
     assert _cap_file_content(short) == short
 
 
-def test_cap_file_content_long_tail_preserved():
+def test_cap_file_content_long_file_truncated():
     big = "a" * 20_000
-    result = _cap_file_content(big, max_chars=8_000)
+    result = _cap_file_content(big)
     assert len(result) < 20_000
-    assert result.endswith("a" * 100)
+    assert "omitted" in result
 
 
 def test_prune_prompt_fires_as_safety_net():

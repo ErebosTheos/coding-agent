@@ -5,6 +5,7 @@ import re
 import shlex
 import shutil
 import sys
+from importlib.metadata import PackageNotFoundError, version as dist_version
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -109,6 +110,15 @@ class DependencyManager:
                 else:
                     results["errors"].append(f"{label} install failed: {res.stderr}")
 
+        # passlib + bcrypt 4.1+ can crash at runtime in generated apps.
+        # Apply a deterministic compatibility pin when passlib is used.
+        if self._project_uses_passlib(generated_files, workspace_root):
+            pinned, pin_error = await self._ensure_passlib_bcrypt_compat(workspace_root)
+            if pinned:
+                results.setdefault("compatibility_fixes", []).append("Pinned bcrypt==4.0.1")
+            if pin_error:
+                results["errors"].append(pin_error)
+
         # Install any whitelisted validation tools that are missing from the environment.
         if validation_commands:
             workspace_root = Path(self.workspace).resolve()
@@ -155,6 +165,49 @@ class DependencyManager:
         results["conftest_injected"] = injected
 
         return results
+
+    @staticmethod
+    def _project_uses_passlib(generated_files: List[GeneratedFile], workspace_root: Path) -> bool:
+        for file in generated_files:
+            if "passlib" in file.content.lower():
+                return True
+
+        for manifest in ("requirements.txt", "pyproject.toml"):
+            path = workspace_root / manifest
+            if not path.exists():
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            if "passlib" in text.lower():
+                return True
+        return False
+
+    async def _ensure_passlib_bcrypt_compat(self, workspace_root: Path) -> tuple[bool, Optional[str]]:
+        import asyncio
+
+        try:
+            installed_bcrypt = dist_version("bcrypt")
+        except PackageNotFoundError:
+            installed_bcrypt = None
+        except Exception:
+            installed_bcrypt = None
+
+        if installed_bcrypt and installed_bcrypt.startswith("4.0.1"):
+            return False, None
+
+        print("  [DependencyManager] Enforcing passlib compatibility: bcrypt==4.0.1")
+        install_cmd = f"{shlex.quote(sys.executable)} -m pip install bcrypt==4.0.1"
+        try:
+            res = await asyncio.to_thread(self.executor, install_cmd, str(workspace_root))
+        except Exception as exc:
+            return False, f"passlib compatibility pin crashed: {exc}"
+
+        if res.exit_code != 0:
+            return False, "passlib compatibility pin failed: bcrypt==4.0.1"
+
+        return True, None
 
     async def _install_inferred_frameworks(
         self,

@@ -111,6 +111,7 @@ class HealingReport:
     attempts: List[HealAttempt]
     final_command_result: Optional[CommandResult] = None
     blocked_reason: Optional[str] = None
+    cache_hits: int = 0          # attempts resolved from PatchCache (zero LLM cost)
 
     def to_dict(self):
         return asdict(self)
@@ -164,6 +165,7 @@ class PipelineReport:
     visual_audit: Optional[VisualAuditResult] = None
     wall_clock_seconds: float = 0.0
     stage_traces: List["StageTrace"] = field(default_factory=list)
+    first_pass_success: bool = False   # True when tests passed before any LLM healing
 
     def to_dict(self):
         return asdict(self)

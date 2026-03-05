@@ -3,171 +3,184 @@ import os
 import tempfile
 import pytest
 from unittest.mock import MagicMock, patch
-from codegen_agent.healer import Healer
+from codegen_agent.healer import Healer, _consolidate_commands, _cap_file_content
 from codegen_agent.models import CommandResult
+
 
 @pytest.fixture
 def temp_workspace():
-    """Create a temporary workspace for testing Healer."""
     with tempfile.TemporaryDirectory() as tmp_dir:
         yield tmp_dir
 
+
 @pytest.fixture
 def healer(temp_workspace):
-    """Create a Healer instance with a mock LLMClient and a temporary workspace."""
     mock_llm = MagicMock()
     return Healer(llm_client=mock_llm, workspace=temp_workspace)
 
-def test_get_most_recent_file_filters_by_extension(healer, temp_workspace):
-    # Create allowed files
-    py_file = os.path.join(temp_workspace, "test.py")
-    with open(py_file, "w") as f:
-        f.write("print('hello')")
-    
-    # Create disallowed files
-    pyc_file = os.path.join(temp_workspace, "test.pyc")
-    with open(pyc_file, "wb") as f:
-        f.write(b"\x00\x01\x02")
-    
-    bin_file = os.path.join(temp_workspace, "test.bin")
-    with open(bin_file, "wb") as f:
-        f.write(b"something binary")
-        
-    # Set mtime so pyc is "newer"
-    os.utime(py_file, (100, 100))
-    os.utime(pyc_file, (200, 200))
-    os.utime(bin_file, (300, 300))
-    
-    recent_file = healer._get_most_recent_file()
-    
-    # It should pick test.py because test.pyc and test.bin are not in ALLOWED_EXTENSIONS
-    assert recent_file == "test.py"
 
-def test_extract_target_file_uses_allowed_extensions(healer):
-    # Create the file first
-    py_path = os.path.join(healer.workspace, "test.py")
-    with open(py_path, "w") as f:
-        f.write("")
-        
-    output = 'Error in File "test.py", line 1'
-    assert healer._extract_target_file(output) == "test.py"
-    
-    output_disallowed = 'Error in File "test.pyc", line 1'
-    # Even if it exists, it should not be extracted if not in ALLOWED_EXTENSIONS
-    pyc_path = os.path.join(healer.workspace, "test.pyc")
-    with open(pyc_path, "w") as f:
-        f.write("")
-        
-    assert healer._extract_target_file(output_disallowed) is None
-    
-    valid_path = os.path.join(healer.workspace, "valid.py")
-    with open(valid_path, "w") as f:
-        f.write("")
-    
-    output_valid = 'Error in File "valid.py", line 1'
-    assert healer._extract_target_file(output_valid) == "valid.py"
+# ── _consolidate_commands ─────────────────────────────────────────────────────
+
+def test_consolidate_pytest_commands_no_x_flag():
+    """Merged pytest command must NOT have -x so all failures are visible."""
+    result = _consolidate_commands(["pytest tests/test_a.py", "pytest tests/test_b.py"])
+    assert len(result) == 1
+    assert "-x" not in result[0]
+    assert "pytest" in result[0]
 
 
-def test_extract_target_file_skips_tests_by_default(healer):
-    test_path = os.path.join(healer.workspace, "tests", "test_logic.py")
-    os.makedirs(os.path.dirname(test_path), exist_ok=True)
-    with open(test_path, "w") as f:
-        f.write("")
-
-    output = 'Error in File "tests/test_logic.py", line 1'
-    assert healer._extract_target_file(output) is None
+def test_consolidate_mixed_commands_unchanged():
+    cmds = ["pytest tests/", "go test ./..."]
+    assert _consolidate_commands(cmds) == cmds
 
 
-def test_extract_target_file_can_edit_tests_when_enabled(temp_workspace):
-    mock_llm = MagicMock()
-    permissive_healer = Healer(
-        llm_client=mock_llm,
-        workspace=temp_workspace,
-        allow_test_file_edits=True,
-    )
-    test_path = os.path.join(temp_workspace, "tests", "test_logic.py")
-    os.makedirs(os.path.dirname(test_path), exist_ok=True)
-    with open(test_path, "w") as f:
-        f.write("")
-
-    output = 'Error in File "tests/test_logic.py", line 1'
-    assert permissive_healer._extract_target_file(output) == "tests/test_logic.py"
+def test_consolidate_empty_unchanged():
+    assert _consolidate_commands([]) == []
 
 
-def test_fix_single_failure_blocks_missing_tool(healer):
+# ── _cap_file_content ─────────────────────────────────────────────────────────
+
+def test_cap_file_content_short_file_unchanged():
+    content = "import os\nprint('hello')\n"
+    assert _cap_file_content(content) == content
+
+
+def test_cap_file_content_large_file_has_head_and_tail():
+    head = "# HEAD\n" + "x = 1\n" * 2000
+    tail = "y = 2\n" * 2000 + "# TAIL\n"   # marker at the end, inside tail window
+    big = head + tail
+    result = _cap_file_content(big)
+    assert "# HEAD" in result
+    assert "# TAIL" in result
+    assert "omitted" in result
+
+
+# ── _extract_all_broken_files ─────────────────────────────────────────────────
+
+def test_extract_all_broken_files_quoted_paths(healer, temp_workspace):
+    for name in ("auth.py", "models.py"):
+        open(os.path.join(temp_workspace, name), "w").close()
+
     failure = CommandResult(
+        command="pytest tests/",
+        exit_code=1,
+        stdout='File "auth.py", line 5\nFile "models.py", line 10',
+        stderr="",
+    )
+    found = healer._extract_all_broken_files(failure)
+    assert "auth.py" in found
+    assert "models.py" in found
+
+
+def test_extract_all_broken_files_skips_test_files(healer, temp_workspace):
+    os.makedirs(os.path.join(temp_workspace, "tests"), exist_ok=True)
+    open(os.path.join(temp_workspace, "src.py"), "w").close()
+    open(os.path.join(temp_workspace, "tests", "test_src.py"), "w").close()
+
+    failure = CommandResult(
+        command="pytest",
+        exit_code=1,
+        stdout='File "tests/test_src.py"\nFile "src.py"',
+        stderr="",
+    )
+    found = healer._extract_all_broken_files(failure)
+    assert "src.py" in found
+    assert "tests/test_src.py" not in found
+
+
+def test_extract_all_broken_files_returns_empty_when_no_match(healer):
+    failure = CommandResult(
+        command="pytest",
+        exit_code=1,
+        stdout="some generic error with no file paths",
+        stderr="",
+    )
+    assert healer._extract_all_broken_files(failure) == []
+
+
+def test_extract_all_broken_files_caps_at_eight(healer, temp_workspace):
+    for i in range(12):
+        open(os.path.join(temp_workspace, f"file{i}.py"), "w").close()
+
+    stdout = " ".join(f'"file{i}.py"' for i in range(12))
+    failure = CommandResult(command="pytest", exit_code=1, stdout=stdout, stderr="")
+    found = healer._extract_all_broken_files(failure)
+    assert len(found) <= 8
+
+
+# ── blocking / auto-fix behaviour (via _fix_file_for_errors / heal internals) ─
+
+def test_blocks_on_missing_tool(healer):
+    """heal() should surface a blocked_reason when a tool is missing."""
+    missing_result = CommandResult(
         command="ruff check .",
         exit_code=127,
         stdout="",
         stderr="/bin/sh: ruff: command not found",
     )
 
-    result = asyncio.run(healer._fix_single_failure(failure, attempt_number=1))
+    async def fake_run(cmd, cwd):
+        return missing_result
 
-    assert isinstance(result, str)
-    assert "Missing tool 'ruff'" in result
+    with patch("codegen_agent.healer.run_shell_command", side_effect=lambda cmd, cwd: missing_result):
+        report = asyncio.run(healer.heal(["ruff check ."]))
+
+    assert not report.success
+    assert report.blocked_reason is not None
+    assert "ruff" in report.blocked_reason
     healer.llm_client.generate.assert_not_called()
 
 
-def test_get_most_recent_file_ignores_pytest_cache(healer, temp_workspace):
-    src_file = os.path.join(temp_workspace, "main.py")
-    with open(src_file, "w") as f:
-        f.write("print('ok')\n")
-
-    cache_dir = os.path.join(temp_workspace, ".pytest_cache")
-    os.makedirs(cache_dir, exist_ok=True)
-    cache_file = os.path.join(cache_dir, "README.md")
-    with open(cache_file, "w") as f:
-        f.write("cache")
-
-    os.utime(src_file, (100, 100))
-    os.utime(cache_file, (200, 200))
-
-    assert healer._get_most_recent_file() == "main.py"
-
-
-def test_fix_single_failure_bootstraps_conftest_for_missing_root_module(healer):
-    stack_file = os.path.join(healer.workspace, "stack.py")
+def test_bootstraps_conftest_for_missing_root_module(healer, temp_workspace):
+    stack_file = os.path.join(temp_workspace, "stack.py")
     with open(stack_file, "w") as f:
         f.write("class Stack:\n    pass\n")
 
-    failure = CommandResult(
+    missing_mod = CommandResult(
         command="pytest tests/",
         exit_code=2,
         stdout="ModuleNotFoundError: No module named 'stack'",
         stderr="",
     )
+    passing = CommandResult(command="pytest tests/", exit_code=0, stdout="", stderr="")
 
-    result = asyncio.run(healer._fix_single_failure(failure, attempt_number=1))
+    call_count = 0
 
-    assert result is not None
-    assert "conftest.py" in result.changed_files
-    conftest_path = os.path.join(healer.workspace, "conftest.py")
+    def fake_run(cmd, cwd):
+        nonlocal call_count
+        call_count += 1
+        return passing if call_count > 1 else missing_mod
+
+    with patch("codegen_agent.healer.run_shell_command", side_effect=fake_run):
+        report = asyncio.run(healer.heal(["pytest tests/"]))
+
+    conftest_path = os.path.join(temp_workspace, "conftest.py")
     assert os.path.exists(conftest_path)
-    with open(conftest_path, "r") as f:
-        assert "ROOT = os.path.dirname" in f.read()
+    assert "ROOT = os.path.dirname" in open(conftest_path).read()
     healer.llm_client.generate.assert_not_called()
 
 
-def test_fix_single_failure_applies_ruff_autofix_without_llm(healer):
+def test_applies_ruff_autofix_without_llm(healer):
     failure = CommandResult(
         command="ruff check .",
         exit_code=1,
         stdout="",
         stderr="I001 Import block is un-sorted or un-formatted",
     )
-    autofix = CommandResult(
-        command="ruff check --fix .",
-        exit_code=0,
-        stdout="",
-        stderr="",
-    )
+    autofix_ok = CommandResult(command="ruff check --fix .", exit_code=0, stdout="", stderr="")
+    passing = CommandResult(command="ruff check .", exit_code=0, stdout="", stderr="")
 
-    with patch("codegen_agent.healer.run_shell_command", return_value=autofix) as mocked:
-        result = asyncio.run(healer._fix_single_failure(failure, attempt_number=1))
+    call_count = 0
 
-    assert result is not None
-    assert result.failure_type.value == "LINT_TYPE_FAILURE"
-    assert "ruff check --fix ." in result.fix_applied
-    mocked.assert_called_once()
+    def fake_run(cmd, cwd):
+        nonlocal call_count
+        call_count += 1
+        if "ruff check --fix" in cmd:
+            return autofix_ok
+        return failure if call_count == 1 else passing
+
+    with patch("codegen_agent.healer.run_shell_command", side_effect=fake_run):
+        report = asyncio.run(healer.heal(["ruff check ."]))
+
     healer.llm_client.generate.assert_not_called()
+    assert any("ruff" in (a.fix_applied or "") for a in report.attempts)

@@ -7,7 +7,14 @@ from codegen_agent.llm.anthropic_api import AnthropicAPIClient
 
 def _primary(client):
     assert isinstance(client, _RetryingLLMClient)
-    return client._primary
+    raw = client._primary
+    # CODEGEN_CACHE=1 in .env wraps the call-client in CachingLLMClient, but
+    # _RetryingLLMClient._primary is always the unwrapped raw provider.
+    # If it somehow is wrapped (future regression), unwrap one level for the check.
+    from codegen_agent.llm.caching_client import CachingLLMClient
+    if isinstance(raw, CachingLLMClient):
+        return raw._client
+    return raw
 
 def test_router_default_config():
     """When CODEGEN_PROVIDER=gemini (no .env override), router returns GeminiCLIClient."""

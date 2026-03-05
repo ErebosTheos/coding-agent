@@ -1,3 +1,4 @@
+import hashlib
 import os
 import re
 import asyncio
@@ -7,37 +8,67 @@ from typing import Dict, List, Optional
 from .models import HealingReport, HealAttempt, FailureType
 from .llm.protocol import LLMClient
 from .classifier import classify_failure
-from .utils import run_shell_command, extract_code_from_markdown, prune_prompt
+from .patch_cache import PatchCache
+from .utils import run_shell_command, extract_code_from_markdown, prune_prompt, find_json_in_text
 
 logger = logging.getLogger(__name__)
 
 HEALER_SYSTEM_PROMPT = """You are an expert Software Engineer specializing in debugging and fixing code.
-Your goal is to fix a failing command by modifying the source code.
-Return ONLY the full corrected file content for the target file. No markdown fences or commentary."""
+
+CRITICAL RULES — violating any of these makes the fix worse than the original:
+- Fix ONLY the specific error shown. Do NOT refactor, rename, or restructure surrounding code.
+- Do NOT change function signatures, class names, or the public API of the file.
+- Do NOT remove existing functionality — only change what is necessary to fix the error.
+- If fixing an ImportError or NameError: look at the "Related files" section to find what
+  is actually exported before writing any import statement.
+- If fixing a missing import: add it to the existing import block, do not rewrite the whole file.
+- Return the COMPLETE corrected file content — not a diff, not a partial excerpt.
+- No markdown fences, no commentary, no explanations before or after the code."""
 
 HEALER_USER_PROMPT_TEMPLATE = """Failing command: {command}
 Failure type: {failure_type}
-Error output:
+
+Error output (root cause is often near the TOP, traceback at the bottom):
 {error_output}
 
-Target file: {file_path}
-Current content:
+File to fix: {file_path}
 {file_content}
 
-Fix the code to resolve the error."""
+Related files — what other modules in this project export (use this to write correct imports):
+{related_files}
+
+Return the complete corrected content of {file_path} only."""
+
+HEALER_MULTI_FILE_PROMPT_TEMPLATE = """Failing command: {command}
+Failure type: {failure_type}
+
+Error output (root cause is often near the TOP, traceback at the bottom):
+{error_output}
+
+Fix ALL broken files listed below. Return a JSON object where keys are file paths and
+values are the complete corrected file contents.
+Example: {{"src/main.py": "...", "src/auth.py": "..."}}
+
+Files to fix:
+{files_to_fix}
+
+Related files — what other modules export (use this to write correct imports):
+{related_files}"""
 
 STATIC_ISSUE_HEALER_USER_PROMPT_TEMPLATE = """Static consistency issues were detected:
 {issues}
 
-Target file: {file_path}
-Current content:
+File to fix: {file_path}
 {file_content}
 
-Fix the file so all listed issues are resolved. Keep behavior unchanged beyond the required fixes."""
+Related files — what other modules export (use this to write correct imports):
+{related_files}
+
+Fix only the listed issues. Return the complete corrected content of {file_path}."""
 
 ALLOWED_EXTENSIONS = {".py", ".js", ".ts", ".tsx", ".go", ".rs", ".html", ".css", ".json", ".md", ".txt"}
 
-# Pre-compile file-extraction patterns once at module load (avoids per-call recompilation)
+# Pre-compile file-extraction patterns once at module load
 _EXT_PATTERN = "|".join(re.escape(ext[1:]) for ext in sorted(ALLOWED_EXTENSIONS) if ext.startswith("."))
 _FILE_QUOTED_RE = re.compile(rf'File "([a-zA-Z0-9_./\-]+\.(?:{_EXT_PATTERN}))(?!\w)"')
 _FILE_GENERAL_RE = re.compile(rf'\b([a-zA-Z0-9_./\-]+\.(?:{_EXT_PATTERN}))(?!\w)')
@@ -59,6 +90,30 @@ _IGNORED_RUNTIME_DIRS = {
     "node_modules",
 }
 
+# ── Async pytest-fixture patterns ─────────────────────────────────────────────
+# Matches: @pytest.fixture[(args)]\n<indent>async def
+_ASYNC_FIXTURE_RE = re.compile(
+    r"@pytest\.fixture\b([^\n]*)\n(\s*async\s+def\s)",
+    re.MULTILINE,
+)
+_PYTEST_ASYNCIO_IMPORT_RE = re.compile(r"^\s*import\s+pytest_asyncio", re.MULTILINE)
+
+# Failure patterns that indicate test-infrastructure problems (not logic bugs).
+# For these the healer should temporarily edit test files.
+_TEST_INFRA_RE = re.compile(
+    r"(async_generator|ScopeMismatch|asyncio.*fixture|fixture.*asyncio"
+    r"|PytestUnraisableException|DeprecationWarning.*pytest_asyncio"
+    r"|ERROR collecting|collection error|ImportError while importing"
+    r"|is not a.*fixture|fixture.*not found)",
+    re.IGNORECASE,
+)
+
+# Maximum LLM fix calls per heal round (prevents slow/messy parallel floods).
+_LLM_FIX_CONCURRENCY = int(os.environ.get("CODEGEN_HEALER_FAN_OUT", "4"))
+
+# Maximum broken files to attempt to fix in a single round.
+_MAX_BROKEN_FILES_PER_ROUND = 4
+
 
 def _is_test_file(path: str) -> bool:
     name = os.path.basename(path)
@@ -72,28 +127,42 @@ def _is_test_file(path: str) -> bool:
     )
 
 
-_HEALER_ERROR_MAX_LINES = 60    # keep the tail — errors are at the bottom of pytest output
-_HEALER_FILE_CONTENT_MAX = 8_000  # chars; ~200 lines; keep the tail for the same reason
+_HEALER_ERROR_MAX_LINES = 80
+_HEALER_FILE_HEAD_CHARS = 3_000   # imports / class defs are at the top
+_HEALER_FILE_TAIL_CHARS = 5_000   # recent changes tend to be at the bottom
+_HEALER_FILE_CONTENT_MAX = _HEALER_FILE_HEAD_CHARS + _HEALER_FILE_TAIL_CHARS
 
 
 def _truncate_error_output(text: str, max_lines: int = _HEALER_ERROR_MAX_LINES) -> str:
-    """Preserve the tail of error output where the actual failure is reported."""
+    """Keep head + tail so both the root cause (top) and failing assertion (bottom) are visible.
+
+    Python import chains put the root ImportError at the top.
+    pytest puts the failing assertion at the bottom. We need both.
+    """
     lines = text.splitlines()
     if len(lines) <= max_lines:
         return text
-    dropped = len(lines) - max_lines
-    return f"[... {dropped} lines truncated ...]\n" + "\n".join(lines[-max_lines:])
+    head_lines = max_lines // 3
+    tail_lines = max_lines - head_lines
+    dropped = len(lines) - head_lines - tail_lines
+    return (
+        "\n".join(lines[:head_lines])
+        + f"\n[... {dropped} lines truncated ...]\n"
+        + "\n".join(lines[-tail_lines:])
+    )
 
 
-def _cap_file_content(content: str, max_chars: int = _HEALER_FILE_CONTENT_MAX) -> str:
-    """Keep the tail of a large file — recent changes (the bug) tend to be at the bottom."""
-    if len(content) <= max_chars:
+def _cap_file_content(content: str) -> str:
+    """Return head + tail of a large file."""
+    if len(content) <= _HEALER_FILE_CONTENT_MAX:
         return content
-    return f"# [...truncated — showing last {max_chars} chars...]\n" + content[-max_chars:]
+    head = content[:_HEALER_FILE_HEAD_CHARS]
+    tail = content[-_HEALER_FILE_TAIL_CHARS:]
+    omitted = len(content) - _HEALER_FILE_HEAD_CHARS - _HEALER_FILE_TAIL_CHARS
+    return f"{head}\n# [...{omitted} chars omitted...]\n{tail}"
 
 
 def _missing_tool_from_output(command: str, stdout: str, stderr: str) -> Optional[str]:
-    """Return missing executable name when failure is an environment/tooling issue."""
     text = f"{stdout}\n{stderr}"
     for pattern in _MISSING_TOOL_PATTERNS:
         match = pattern.search(text)
@@ -118,8 +187,51 @@ def _conftest_bootstrap_content() -> str:
     )
 
 
+def _failure_hash(failures: list) -> str:
+    """Stable hash of failure outputs used by HealerLoopGuard to detect stuck loops."""
+    combined = "|".join(
+        f"{r.exit_code}:{(r.stdout + r.stderr)[-800:]}"
+        for r in sorted(failures, key=lambda r: r.command)
+    )
+    return hashlib.sha256(combined.encode(), usedforsecurity=False).hexdigest()
+
+
+def _file_set_hash(file_paths: frozenset[str]) -> str:
+    """Stable hash of a set of file paths (for no-progress detection)."""
+    combined = "|".join(sorted(file_paths))
+    return hashlib.sha256(combined.encode(), usedforsecurity=False).hexdigest()
+
+
+def _content_hash(workspace: str, file_paths) -> str:
+    """SHA-256 of the current on-disk content of the given files (order-independent)."""
+    parts = []
+    for fp in sorted(file_paths):
+        full = Path(workspace) / fp
+        if full.exists():
+            parts.append(hashlib.sha256(full.read_bytes(), usedforsecurity=False).hexdigest()[:16])
+        else:
+            parts.append("missing")
+    return "|".join(parts)
+
+
+def _patch_cache_key(
+    failure_hash: str,
+    file_paths,
+    workspace: str,
+    model: str = "",
+) -> str:
+    """Hardened cache key: failure hash + hash of target file contents + model.
+
+    Including file-content hashes prevents stale patches from being applied
+    after the files have been significantly changed between runs.
+    """
+    file_sig = _content_hash(workspace, file_paths)
+    raw = f"{model}|{failure_hash}|{file_sig}"
+    return hashlib.sha256(raw.encode(), usedforsecurity=False).hexdigest()
+
+
 def _consolidate_commands(commands: List[str]) -> List[str]:
-    """Merge all-pytest command lists into a single pytest -q -x invocation."""
+    """Merge all-pytest command lists into a single run showing ALL failures."""
     if not commands:
         return commands
     all_pytest = all(
@@ -127,8 +239,82 @@ def _consolidate_commands(commands: List[str]) -> List[str]:
         for cmd in commands
     )
     if all_pytest:
-        return ["pytest -q -x"]
+        return ["pytest -q --tb=short"]
     return commands
+
+
+def _is_test_infra_failure(failures: list) -> bool:
+    """True when failures look like test infrastructure (fixture/collection errors).
+
+    For these the healer enables temporary test-file editing: the broken file
+    is the test, not the app.
+    """
+    combined = " ".join(f.stdout + f.stderr for f in failures)
+    return bool(_TEST_INFRA_RE.search(combined))
+
+
+def _fix_async_pytest_fixtures(content: str) -> Optional[str]:
+    """Replace @pytest.fixture + async def → @pytest_asyncio.fixture + async def.
+
+    Also injects `import pytest_asyncio` if not already present.
+    Returns fixed content or None if no change was needed.
+    """
+    if "async def" not in content or "@pytest.fixture" not in content:
+        return None
+
+    new_content = _ASYNC_FIXTURE_RE.sub(r"@pytest_asyncio.fixture\1\n\2", content)
+    if new_content == content:
+        return None
+
+    # Ensure import is present
+    if not _PYTEST_ASYNCIO_IMPORT_RE.search(new_content):
+        # Insert after `import pytest` if present
+        new_content = re.sub(
+            r"^(import pytest\b)",
+            r"\1\nimport pytest_asyncio",
+            new_content,
+            count=1,
+            flags=re.MULTILINE,
+        )
+        # If still missing, prepend at top
+        if not _PYTEST_ASYNCIO_IMPORT_RE.search(new_content):
+            new_content = "import pytest_asyncio\n" + new_content
+
+    return new_content
+
+
+def _ensure_asyncio_mode_auto(workspace: str) -> bool:
+    """Add asyncio_mode = auto to pyproject.toml or pytest.ini.
+
+    Returns True if a config file was written/modified.
+    """
+    pyproject = Path(workspace) / "pyproject.toml"
+    if pyproject.exists():
+        text = pyproject.read_text(encoding="utf-8")
+        if "asyncio_mode" in text:
+            return False
+        if "[tool.pytest.ini_options]" in text:
+            new = text.replace(
+                "[tool.pytest.ini_options]",
+                '[tool.pytest.ini_options]\nasyncio_mode = "auto"',
+                1,
+            )
+        else:
+            new = text.rstrip() + '\n\n[tool.pytest.ini_options]\nasyncio_mode = "auto"\n'
+        pyproject.write_text(new, encoding="utf-8")
+        return True
+
+    pytest_ini = Path(workspace) / "pytest.ini"
+    if pytest_ini.exists():
+        text = pytest_ini.read_text(encoding="utf-8")
+        if "asyncio_mode" in text:
+            return False
+        pytest_ini.write_text(text.rstrip() + "\nasyncio_mode = auto\n", encoding="utf-8")
+        return True
+
+    # Create minimal pytest.ini
+    pytest_ini.write_text("[pytest]\nasyncio_mode = auto\n", encoding="utf-8")
+    return True
 
 
 class Healer:
@@ -143,54 +329,207 @@ class Healer:
         self.workspace = workspace
         self.max_attempts = max_attempts
         self.allow_test_file_edits = allow_test_file_edits
+        _cache_env = os.environ.get("CODEGEN_PATCH_CACHE", "1").strip()
+        self._patch_cache: Optional[PatchCache] = (
+            PatchCache(workspace) if _cache_env != "0" else None
+        )
+        # Model identifier for cache key hardening
+        _model_attr = getattr(llm_client, "model", None) or getattr(llm_client, "_model", None)
+        self._model_id: str = str(_model_attr) if _model_attr else ""
 
     async def heal(self, validation_commands: List[str]) -> HealingReport:
-        """Runs the healing loop: run tests -> fix all failures in parallel -> retry."""
-        attempts = []
-        failures = []
+        """Run tests → extract ALL broken files → fix in parallel → repeat."""
+        attempts: List[HealAttempt] = []
+        last_failures = []
+        _seen_failure_hashes: set[str] = set()   # HealerLoopGuard: identical output
+        _seen_file_set_hashes: set[str] = set()  # No-progress: same broken file set
+        _cache_hits = 0
 
-        for i in range(1, self.max_attempts + 1):
-            consolidated = _consolidate_commands(validation_commands)
-            run_tasks = [asyncio.to_thread(run_shell_command, cmd, cwd=self.workspace) for cmd in consolidated]
+        for attempt_num in range(1, self.max_attempts + 1):
+            commands = _consolidate_commands(validation_commands)
+            run_tasks = [
+                asyncio.to_thread(run_shell_command, cmd, cwd=self.workspace)
+                for cmd in commands
+            ]
             results = await asyncio.gather(*run_tasks)
+            last_failures = [r for r in results if r.exit_code != 0]
 
-            # If consolidated command failed and we collapsed multiple commands, retry individually
-            if consolidated != validation_commands and any(r.exit_code != 0 for r in results):
-                run_tasks = [asyncio.to_thread(run_shell_command, cmd, cwd=self.workspace) for cmd in validation_commands]
-                results = await asyncio.gather(*run_tasks)
+            if not last_failures:
+                return HealingReport(
+                    success=True,
+                    attempts=attempts,
+                    final_command_result=results[-1] if results else None,
+                    cache_hits=_cache_hits,
+                )
 
-            failures = [res for res in results if res.exit_code != 0]
+            # ── HealerLoopGuard: stop on identical failure output ──────────────
+            _fhash = _failure_hash(last_failures)
+            if _fhash in _seen_failure_hashes:
+                print(
+                    f"  [Healer] Attempt {attempt_num}: failure output unchanged "
+                    "across attempts — heal loop is stuck, stopping early."
+                )
+                break
+            _seen_failure_hashes.add(_fhash)
 
-            if not failures:
-                return HealingReport(success=True, attempts=attempts, final_command_result=results[-1] if results else None)
+            # ── Detect test-infrastructure failures: temporarily allow test edits ─
+            _test_infra = _is_test_infra_failure(last_failures)
+            _effective_allow_test_edits = self.allow_test_file_edits or _test_infra
 
-            # Fix all failures concurrently; deduplicate by target file to avoid write conflicts
-            fix_tasks = [self._fix_single_failure(failure, i) for failure in failures]
-            fix_results = await asyncio.gather(*fix_tasks, return_exceptions=True)
+            # ── PatchCache: apply known-good patch (zero LLM) ─────────────────
+            _cache_key: Optional[str] = None
+            if self._patch_cache:
+                _broken_candidates = self._extract_broken_files_raw(last_failures)
+                _cache_key = _patch_cache_key(
+                    _fhash, _broken_candidates, self.workspace, self._model_id
+                )
+                cached_patch = self._patch_cache.get(_cache_key)
+                if cached_patch:
+                    _applied = []
+                    for fp, content in cached_patch.items():
+                        full = Path(self.workspace) / fp
+                        if full.exists():
+                            full.write_text(content, encoding="utf-8")
+                            _applied.append(fp)
+                    if _applied:
+                        print(
+                            f"  [PatchCache] Cache hit — applied {len(_applied)} cached patch(es)"
+                            f" for attempt {attempt_num} (no LLM call)"
+                        )
+                        _cache_hits += 1
+                        attempts.append(HealAttempt(
+                            attempt_number=attempt_num,
+                            failure_type=FailureType.UNKNOWN,
+                            fix_applied=f"PatchCache hit: applied {_applied}",
+                            changed_files=_applied,
+                            note="Applied from persistent patch cache — no LLM call",
+                        ))
+                        continue
 
-            batch_attempts = []
-            blocked = None
-            for res in fix_results:
-                if isinstance(res, Exception):
-                    blocked = str(res)
-                elif res is None:
-                    pass  # skipped (duplicate file or path error)
-                elif isinstance(res, str):
-                    blocked = res  # blocked_reason string
-                else:
-                    batch_attempts.append(res)
+            # ── Pre-process each failure: blocking / auto-fix / collect LLM targets
+            file_errors: dict[str, list] = {}
+            blocked: Optional[str] = None
 
-            attempts.extend(batch_attempts)
+            for failure in last_failures:
+                # Blocking: timed-out process
+                if failure.exit_code == -1 and "timeout" in (failure.stderr or "").lower():
+                    blocked = (
+                        f"Command timed out: {failure.command!r}. "
+                        "Cannot heal a hanging process via code changes."
+                    )
+                    break
 
-            if blocked and not batch_attempts:
+                # Deterministic: command-specific auto-fixes (no LLM)
+                auto_fix = await self._apply_known_auto_fixes(failure, attempt_num)
+                if auto_fix:
+                    attempts.append(auto_fix)
+                    continue
+
+                # Blocking: missing executable
+                missing_tool = _missing_tool_from_output(
+                    failure.command, failure.stdout, failure.stderr
+                )
+                if missing_tool:
+                    blocked = (
+                        f"Missing tool '{missing_tool}' required by command "
+                        f"{failure.command!r}. Install it in the environment."
+                    )
+                    break
+
+                # ── Command gating: run ruff --fix before LLM when pytest fails ─
+                # This strips lint noise from the failure set cheaply. Runs once
+                # (only when pytest is the failing command and ruff is available).
+                ruff_fix = await self._try_ruff_auto_fix(failure, attempt_num)
+                if ruff_fix:
+                    attempts.append(ruff_fix)
+                    # Don't `continue` — still extract broken files in case
+                    # ruff fixed lint but the test still fails for other reasons.
+
+                # Deterministic: async fixture rewrite (zero LLM)
+                async_fix = await self._fix_async_fixtures_deterministically(
+                    failure, attempt_num
+                )
+                if async_fix:
+                    attempts.append(async_fix)
+                    continue  # re-run tests after fixture fix
+
+                # Deterministic: missing conftest.py (no LLM)
+                det = self._fix_pytest_import_path_if_needed(failure, attempt_num)
+                if det:
+                    attempts.append(det)
+                    continue
+
+                # LLM fixes: collect broken files (respecting test-edit flag)
+                broken = self._extract_all_broken_files(
+                    failure, allow_test_files=_effective_allow_test_edits
+                )
+                for fp in broken:
+                    if fp not in file_errors:
+                        file_errors[fp] = []
+                    file_errors[fp].append(failure)
+
+            if blocked and not file_errors:
                 return HealingReport(
                     success=False,
                     attempts=attempts,
-                    final_command_result=failures[0],
+                    final_command_result=last_failures[0],
                     blocked_reason=blocked,
                 )
 
-        return HealingReport(success=False, attempts=attempts, final_command_result=failures[0] if failures else None)
+            if not file_errors:
+                if attempts:
+                    continue
+                break  # nothing fixable
+
+            # ── No-progress guard: same broken file set as a previous round ────
+            _fset_hash = _file_set_hash(frozenset(file_errors.keys()))
+            if _fset_hash in _seen_file_set_hashes:
+                print(
+                    f"  [Healer] Attempt {attempt_num}: same broken file set repeats "
+                    "— no progress, stopping early."
+                )
+                break
+            _seen_file_set_hashes.add(_fset_hash)
+
+            # ── Record pre-fix content hashes for diff check ─────────────────
+            _pre_hash = _content_hash(self.workspace, file_errors.keys())
+
+            # ── Fix broken files (capped fan-out, bounded concurrency) ────────
+            batch_attempts = await self._fix_files_parallel(
+                file_errors, attempt_num, _effective_allow_test_edits
+            )
+            attempts.extend(batch_attempts)
+
+            # ── No-progress guard: patch produced no diff ─────────────────────
+            _post_hash = _content_hash(self.workspace, file_errors.keys())
+            if _pre_hash == _post_hash and batch_attempts:
+                print(
+                    f"  [Healer] Attempt {attempt_num}: LLM applied no file changes "
+                    "— stopping early."
+                )
+                break
+
+            # ── PatchCache: store patches for next run ────────────────────────
+            if self._patch_cache and file_errors:
+                patch_to_store: dict[str, str] = {}
+                for fp in file_errors:
+                    full = Path(self.workspace) / fp
+                    if full.exists():
+                        patch_to_store[fp] = full.read_text(encoding="utf-8")
+                if patch_to_store:
+                    # Store under the pre-fix cache key so future identical failures
+                    # can reuse the patch before another LLM call.
+                    _store_key = _cache_key or _patch_cache_key(
+                        _fhash, list(file_errors.keys()), self.workspace, self._model_id
+                    )
+                    self._patch_cache.put(_store_key, patch_to_store)
+
+        return HealingReport(
+            success=False,
+            attempts=attempts,
+            final_command_result=last_failures[0] if last_failures else None,
+            cache_hits=_cache_hits,
+        )
 
     async def heal_static_issues(
         self,
@@ -209,22 +548,20 @@ class Healer:
                 logger.warning("Skipping static heal for test file: %s", target_file)
                 return None
 
-            with open(full_path, 'r') as f:
-                content = f.read()
-
+            content = full_path.read_text(encoding="utf-8")
             issue_lines = "\n".join(f"- {issue}" for issue in issues)
+            related_files = self._build_related_files_context(target_file)
             prompt = STATIC_ISSUE_HEALER_USER_PROMPT_TEMPLATE.format(
                 issues=issue_lines,
                 file_path=target_file,
-                file_content=_cap_file_content(content),
+                file_content=f"Current content:\n{_cap_file_content(content)}",
+                related_files=related_files,
             )
-            prompt = prune_prompt(prompt, max_chars=16_000)
+            prompt = prune_prompt(prompt, max_chars=20_000)
             fixed_content = await self.llm_client.generate(prompt, system_prompt=HEALER_SYSTEM_PROMPT)
             fixed_content = self._normalize_content(fixed_content)
 
-            with open(full_path, 'w') as f:
-                f.write(fixed_content)
-
+            full_path.write_text(fixed_content, encoding="utf-8")
             return HealAttempt(
                 attempt_number=attempt_number,
                 failure_type=FailureType.BUILD_ERROR,
@@ -232,88 +569,317 @@ class Healer:
                 changed_files=[target_file],
             )
 
-        tasks = [
-            _fix_static_issue(target_file, issues)
-            for target_file, issues in issues_by_file.items()
-        ]
+        tasks = [_fix_static_issue(fp, issues) for fp, issues in issues_by_file.items()]
         results = await asyncio.gather(*tasks, return_exceptions=True)
+        return [r for r in results if isinstance(r, HealAttempt)]
 
-        attempts: List[HealAttempt] = []
-        for result in results:
-            if isinstance(result, Exception):
+    # ── Private helpers ────────────────────────────────────────────────────────
+
+    async def _fix_files_parallel(
+        self,
+        file_errors: dict[str, list],
+        attempt_num: int,
+        allow_test_files: bool = False,
+    ) -> List[HealAttempt]:
+        """Fix broken files. Uses combined multi-file fix when >1 file is broken
+        (single LLM call sees all broken files together — better for cross-file errors).
+        Falls back to per-file parallel fixes if multi-file call fails or returns bad JSON.
+        """
+        fixable = {
+            fp: errs for fp, errs in file_errors.items()
+            if self._is_fixable_file(fp, allow_test_files=allow_test_files)
+               or (allow_test_files and _is_test_file(fp))
+        }
+        if not fixable:
+            return []
+
+        if len(fixable) > 1:
+            combined = await self._fix_files_combined(fixable, attempt_num)
+            if combined:
+                return combined
+
+        # Single file or combined fix failed — parallel per-file fixes
+        sem = asyncio.Semaphore(_LLM_FIX_CONCURRENCY)
+
+        async def _guarded(fp: str, errs: list) -> Optional[HealAttempt]:
+            async with sem:
+                return await self._fix_file_for_errors(
+                    fp, errs, attempt_num, allow_test_files=allow_test_files
+                )
+
+        tasks = [_guarded(fp, errs) for fp, errs in fixable.items()]
+        batch = await asyncio.gather(*tasks, return_exceptions=True)
+        return [r for r in batch if isinstance(r, HealAttempt)]
+
+    async def _fix_files_combined(
+        self,
+        file_errors: dict[str, list],
+        attempt_num: int,
+    ) -> List[HealAttempt]:
+        """Fix multiple broken files in a single LLM call.
+
+        Sends all broken file contents + error context together so the LLM can see
+        cross-file import relationships and fix them consistently.
+        Returns an empty list if the response is not valid JSON (caller falls back).
+        """
+        # Collect all failures for command/type
+        all_failures = [f for errs in file_errors.values() for f in errs]
+        failure_type = classify_failure(
+            all_failures[0].command, all_failures[0].stdout, all_failures[0].stderr
+        )
+        combined_errors = _truncate_error_output(
+            "\n\n".join(
+                f"$ {f.command}\n{f.stdout}\n{f.stderr}" for f in all_failures[:3]
+            )
+        )
+
+        # Build files_to_fix section
+        files_section_parts = []
+        for fp, errs in file_errors.items():
+            full_path = Path(self.workspace) / fp
+            if not full_path.exists():
                 continue
-            if result is None:
+            content = full_path.read_text(encoding="utf-8")
+            files_section_parts.append(
+                f"--- {fp} ---\n{_cap_file_content(content)}"
+            )
+        if not files_section_parts:
+            return []
+        files_section = "\n\n".join(files_section_parts)
+
+        # Build related files from the first broken file's directory context
+        first_fp = next(iter(file_errors))
+        related_files = self._build_related_files_context(first_fp, max_files=8)
+
+        prompt = HEALER_MULTI_FILE_PROMPT_TEMPLATE.format(
+            command=all_failures[0].command,
+            failure_type=failure_type.value,
+            error_output=combined_errors,
+            files_to_fix=files_section,
+            related_files=related_files,
+        )
+        prompt = prune_prompt(prompt, max_chars=24_000)
+
+        response = await self.llm_client.generate(prompt, system_prompt=HEALER_SYSTEM_PROMPT)
+
+        # Parse JSON response
+        data = find_json_in_text(response)
+        if not data or not isinstance(data, dict):
+            return []  # caller falls back to per-file
+
+        attempts = []
+        for fp, fixed_content in data.items():
+            if not isinstance(fixed_content, str) or not fixed_content.strip():
                 continue
-            attempts.append(result)
+            full_path = Path(self.workspace) / fp
+            if not full_path.exists():
+                continue
+            fixed_content = self._normalize_content(fixed_content)
+            full_path.write_text(fixed_content, encoding="utf-8")
+            print(f"  [Healer] Multi-fix: wrote {fp} (attempt {attempt_num})")
+            attempts.append(HealAttempt(
+                attempt_number=attempt_num,
+                failure_type=failure_type,
+                fix_applied=f"Multi-file fix: {fp}",
+                changed_files=[fp],
+                note="Combined multi-file LLM fix",
+            ))
         return attempts
 
-    async def _fix_single_failure(self, last_result, attempt_number: int):
-        """Attempt to fix one failing command. Returns HealAttempt, a blocked_reason str, or None."""
-        # Don't burn an LLM call on a timed-out process — it's a structural issue, not a code bug.
-        if last_result.exit_code == -1 and "timeout" in (last_result.stderr or "").lower():
-            return f"Command timed out: {last_result.command!r}. Cannot heal a hanging process via code changes."
-        missing_tool = _missing_tool_from_output(
-            last_result.command,
-            last_result.stdout,
-            last_result.stderr,
+    def _extract_broken_files_raw(self, failures: list) -> list[str]:
+        """Extract candidate broken file paths without workspace-existence check.
+        Used for cache-key computation before editing.
+        """
+        seen: list[str] = []
+        output = " ".join(f"{r.stdout}\n{r.stderr}" for r in failures)
+        for match in _FILE_QUOTED_RE.finditer(output):
+            fp = match.group(1).strip(".,:;)]}")
+            if fp not in seen:
+                seen.append(fp)
+        if not seen:
+            for match in _FILE_GENERAL_RE.finditer(output):
+                fp = match.group(1).strip(".,:;)]}")
+                if fp not in seen:
+                    seen.append(fp)
+        return seen[:_MAX_BROKEN_FILES_PER_ROUND]
+
+    def _extract_all_broken_files(
+        self, result, allow_test_files: bool = False
+    ) -> List[str]:
+        """Return fixable source files referenced in error output (max 4).
+
+        Capped at _MAX_BROKEN_FILES_PER_ROUND to prevent slow/messy fan-out.
+        """
+        output = f"{result.stdout}\n{result.stderr}"
+        seen: List[str] = []
+
+        for match in _FILE_QUOTED_RE.finditer(output):
+            fp = match.group(1).strip(".,:;)]}")
+            if self._is_fixable_file(fp, allow_test_files=allow_test_files) and fp not in seen:
+                seen.append(fp)
+
+        if not seen:
+            for match in _FILE_GENERAL_RE.finditer(output):
+                fp = match.group(1).strip(".,:;)]}")
+                if self._is_fixable_file(fp, allow_test_files=allow_test_files) and fp not in seen:
+                    seen.append(fp)
+
+        return seen[:_MAX_BROKEN_FILES_PER_ROUND]
+
+    def _is_fixable_file(self, fp: str, allow_test_files: bool = False) -> bool:
+        """True if fp is a real fixable file inside the workspace."""
+        if _is_ignored_runtime_path(fp):
+            return False
+        if not allow_test_files and not self.allow_test_file_edits and _is_test_file(fp):
+            return False
+        return os.path.exists(os.path.join(self.workspace, fp))
+
+    def _build_related_files_context(self, target_file_path: str, max_files: int = 6) -> str:
+        """Build a compact summary of what other project files export.
+
+        Reads sibling source files and extracts their top-level definitions so the
+        LLM healer knows exactly what is importable — prevents it from guessing and
+        re-introducing the same ImportError / NameError it is trying to fix.
+        """
+        workspace = Path(self.workspace)
+        target_dir = Path(target_file_path).parent
+        ext = Path(target_file_path).suffix.lower()
+
+        # Collect candidate related files: same directory first, then workspace root
+        candidates: list[Path] = []
+        for p in sorted((workspace / target_dir).glob(f"*{ext}")):
+            rel = str(p.relative_to(workspace))
+            if rel != target_file_path and not _is_ignored_runtime_path(rel):
+                candidates.append(p)
+        for p in sorted(workspace.glob(f"*{ext}")):
+            rel = str(p.relative_to(workspace))
+            if rel != target_file_path and p not in candidates and not _is_ignored_runtime_path(rel):
+                candidates.append(p)
+
+        lines: list[str] = []
+        for p in candidates[:max_files]:
+            rel = str(p.relative_to(workspace))
+            try:
+                text = p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            # Extract only top-level definitions (class / def / CONSTANT = ...)
+            exports: list[str] = []
+            for line in text.splitlines()[:120]:
+                s = line.strip()
+                if s.startswith(("class ", "def ", "async def ")):
+                    name = s.split("(")[0].split(":")[0].split()[1]
+                    exports.append(name)
+                elif re.match(r"^[A-Z_][A-Z0-9_]+ *=", s):
+                    exports.append(s.split("=")[0].strip())
+            if exports:
+                lines.append(f"  {rel}: exports [{', '.join(exports[:20])}]")
+            else:
+                lines.append(f"  {rel}")
+        return "\n".join(lines) if lines else "  (no related files found)"
+
+    async def _fix_file_for_errors(
+        self,
+        file_path: str,
+        failures: list,
+        attempt_num: int,
+        allow_test_files: bool = False,
+    ) -> Optional[HealAttempt]:
+        """LLM-fix a single source file using all error outputs that reference it."""
+        full_path, path_err = self._resolve_target_path(file_path)
+        if path_err:
+            return None
+        if _is_test_file(file_path) and not allow_test_files and not self.allow_test_file_edits:
+            return None
+
+        content = full_path.read_text(encoding="utf-8")
+        failure_type = classify_failure(
+            failures[0].command, failures[0].stdout, failures[0].stderr
         )
-        if missing_tool:
-            return (
-                f"Missing tool '{missing_tool}' required by validation command "
-                f"{last_result.command!r}. Install it in the environment; "
-                "this is not healable via source edits."
+
+        if len(failures) == 1:
+            combined_errors = _truncate_error_output(
+                f"{failures[0].stdout}\n{failures[0].stderr}"
             )
+        else:
+            parts = [
+                f"$ {f.command}\n{_truncate_error_output(f'{f.stdout}\n{f.stderr}', max_lines=40)}"
+                for f in failures
+            ]
+            combined_errors = "\n\n---\n\n".join(parts)
 
-        auto_fix = await self._apply_known_auto_fixes(last_result, attempt_number)
-        if auto_fix:
-            return auto_fix
-
-        deterministic_fix = self._fix_pytest_import_path_if_needed(last_result, attempt_number)
-        if deterministic_fix:
-            return deterministic_fix
-
-        failure_type = classify_failure(last_result.command, last_result.stdout, last_result.stderr)
-
-        target_file = self._extract_target_file(last_result.stderr)
-        if not target_file:
-            target_file = self._extract_target_file(last_result.stdout)
-        if not target_file:
-            target_file = self._get_most_recent_file()
-
-        if not target_file:
-            return "Could not identify target file from error output."
-        if _is_test_file(target_file) and not self.allow_test_file_edits:
-            return f"Refusing to edit test file {target_file}. No source-file target found."
-
-        full_path, path_error = self._resolve_target_path(target_file)
-        if path_error:
-            return path_error
-        if not full_path:
-            return f"Target file {target_file} not found."
-
-        with open(full_path, 'r') as f:
-            content = f.read()
+        related_files = self._build_related_files_context(file_path)
 
         prompt = HEALER_USER_PROMPT_TEMPLATE.format(
-            command=last_result.command,
+            command=failures[0].command,
             failure_type=failure_type.value,
-            error_output=_truncate_error_output(f"{last_result.stdout}\n{last_result.stderr}"),
-            file_path=target_file,
-            file_content=_cap_file_content(content),
+            error_output=combined_errors,
+            file_path=file_path,
+            file_content=f"Current content:\n{_cap_file_content(content)}",
+            related_files=related_files,
         )
-        prompt = prune_prompt(prompt, max_chars=16_000)
+        prompt = prune_prompt(prompt, max_chars=20_000)
 
-        fixed_content = await self.llm_client.generate(prompt, system_prompt=HEALER_SYSTEM_PROMPT)
-        fixed_content = self._normalize_content(fixed_content)
+        fixed = await self.llm_client.generate(prompt, system_prompt=HEALER_SYSTEM_PROMPT)
+        fixed = self._normalize_content(fixed)
 
-        with open(full_path, 'w') as f:
-            f.write(fixed_content)
-
+        full_path.write_text(fixed, encoding="utf-8")
+        print(f"  [Healer] Fixed {file_path} (attempt {attempt_num})")
         return HealAttempt(
-            attempt_number=attempt_number,
+            attempt_number=attempt_num,
             failure_type=failure_type,
-            fix_applied=f"Fixed {target_file}",
-            changed_files=[target_file],
+            fix_applied=f"Fixed {file_path}",
+            changed_files=[file_path],
+        )
+
+    async def _fix_async_fixtures_deterministically(
+        self, failure, attempt_num: int
+    ) -> Optional[HealAttempt]:
+        """Deterministically rewrite @pytest.fixture async def → @pytest_asyncio.fixture.
+
+        Also writes asyncio_mode=auto to pytest config.
+        Runs zero LLM calls. Returns HealAttempt if any file was changed.
+        """
+        combined = f"{failure.stdout}\n{failure.stderr}"
+        if not _TEST_INFRA_RE.search(combined):
+            return None
+        if "async" not in combined and "asyncio" not in combined:
+            return None
+
+        changed: list[str] = []
+
+        # Fix all test files in the workspace
+        for test_path in Path(self.workspace).rglob("test_*.py"):
+            rel = str(test_path.relative_to(self.workspace))
+            if _is_ignored_runtime_path(rel):
+                continue
+            try:
+                content = test_path.read_text(encoding="utf-8")
+                fixed = _fix_async_pytest_fixtures(content)
+                if fixed:
+                    test_path.write_text(fixed, encoding="utf-8")
+                    changed.append(rel)
+            except Exception:
+                continue
+
+        # Ensure asyncio_mode=auto in pytest config
+        if _ensure_asyncio_mode_auto(self.workspace):
+            changed.append("pytest.ini/pyproject.toml")
+
+        if not changed:
+            return None
+
+        print(
+            f"  [Healer] Async fixture deterministic fix: "
+            f"{[c for c in changed if not c.startswith('pytest')]} "
+            f"+ asyncio_mode=auto"
+        )
+        return HealAttempt(
+            attempt_number=attempt_num,
+            failure_type=FailureType.BUILD_ERROR,
+            fix_applied=f"Async fixture rewrite + asyncio_mode=auto ({len(changed)} file(s))",
+            changed_files=changed,
+            note="Deterministic: @pytest.fixture async def → @pytest_asyncio.fixture",
         )
 
     def _fix_pytest_import_path_if_needed(self, last_result, attempt_number: int) -> Optional[HealAttempt]:
@@ -341,8 +907,38 @@ class Healer:
         return HealAttempt(
             attempt_number=attempt_number,
             failure_type=FailureType.BUILD_ERROR,
-            fix_applied=f"Added conftest.py to fix pytest import path for module '{module_name}'",
+            fix_applied=f"Added conftest.py to fix pytest import path for '{module_name}'",
             changed_files=["conftest.py"],
+        )
+
+    async def _try_ruff_auto_fix(self, failure, attempt_num: int) -> Optional[HealAttempt]:
+        """Run ruff --fix when pytest fails to remove lint noise before LLM.
+
+        Only fires when pytest is the failing command and ruff is installed.
+        Runs at most once per heal round.
+        """
+        command = (failure.command or "").strip()
+        # Only gate on pytest failures; ruff failures are handled separately
+        if "pytest" not in command and "python -m pytest" not in command:
+            return None
+        # Only run ruff if it's not explicitly disabled
+        if os.environ.get("CODEGEN_SKIP_RUFF_GATE", "0").strip() == "1":
+            return None
+
+        fix_result = await asyncio.to_thread(
+            run_shell_command, "ruff check --fix .", cwd=self.workspace
+        )
+        if fix_result.exit_code not in (0, 1):
+            return None  # ruff not installed or fatal error — skip silently
+
+        return HealAttempt(
+            attempt_number=attempt_num,
+            failure_type=FailureType.LINT_TYPE_FAILURE,
+            fix_applied="ruff --fix pre-pass before LLM heal",
+            changed_files=[],
+            note=_truncate_error_output(
+                f"{fix_result.stdout}\n{fix_result.stderr}", max_lines=10
+            ) or None,
         )
 
     async def _apply_known_auto_fixes(self, last_result, attempt_number: int) -> Optional[HealAttempt]:
@@ -353,7 +949,9 @@ class Healer:
             if fix_result.exit_code in (0, 1):
                 note = None
                 if fix_result.exit_code != 0:
-                    note = _truncate_error_output(f"{fix_result.stdout}\n{fix_result.stderr}", max_lines=20)
+                    note = _truncate_error_output(
+                        f"{fix_result.stdout}\n{fix_result.stderr}", max_lines=20
+                    )
                 return HealAttempt(
                     attempt_number=attempt_number,
                     failure_type=FailureType.LINT_TYPE_FAILURE,
@@ -373,51 +971,6 @@ class Healer:
         if not full_path.exists():
             return None, f"Target file {target_file} not found."
         return full_path, None
-
-    def _extract_target_file(self, output: str) -> Optional[str]:
-        """Extracts the most likely target file from error output."""
-        if not output:
-            return None
-        matches = _FILE_QUOTED_RE.findall(output)
-        if not matches:
-            matches = _FILE_GENERAL_RE.findall(output)
-            
-        if not matches:
-            return None
-        
-        for match in matches:
-            match = match.strip(".,:;)]}")
-            if _is_ignored_runtime_path(match):
-                continue
-            if not self.allow_test_file_edits and _is_test_file(match):
-                continue
-            if os.path.exists(os.path.join(self.workspace, match)):
-                return match
-        return None
-
-    def _get_most_recent_file(self) -> Optional[str]:
-        """Finds the most recently modified source file in the workspace."""
-        files = []
-        for root, dirnames, filenames in os.walk(self.workspace):
-            dirnames[:] = [
-                d for d in dirnames
-                if d not in _IGNORED_RUNTIME_DIRS and not d.startswith(".")
-            ]
-            for f in filenames:
-                if any(f.endswith(ext) for ext in ALLOWED_EXTENSIONS):
-                    path = os.path.join(root, f)
-                    rel = os.path.relpath(path, self.workspace)
-                    if _is_ignored_runtime_path(rel):
-                        continue
-                    if not self.allow_test_file_edits and _is_test_file(rel):
-                        continue
-                    files.append((path, os.path.getmtime(path)))
-        
-        if not files:
-            return None
-        
-        files.sort(key=lambda x: x[1], reverse=True)
-        return os.path.relpath(files[0][0], self.workspace)
 
     def _normalize_content(self, content: str) -> str:
         code_blocks = extract_code_from_markdown(content)
