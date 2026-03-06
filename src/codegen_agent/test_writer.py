@@ -315,7 +315,8 @@ class TestWriter:
             scripts = payload.get("scripts")
             if isinstance(scripts, dict):
                 return any(isinstance(v, str) and "jest" in v.lower() for v in scripts.values())
-        except: pass
+        except Exception:
+            pass
         return False
 
     @staticmethod
@@ -325,10 +326,12 @@ class TestWriter:
         if tox_ini.exists():
             try:
                 if "[pytest]" in tox_ini.read_text(encoding="utf-8"): return True
-            except: pass
+            except Exception:
+                pass
         pyproject = workspace_root / "pyproject.toml"
         if pyproject.exists():
             try:
                 if "[tool.pytest.ini_options]" in pyproject.read_text(encoding="utf-8"): return True
-            except: pass
+            except Exception:
+                pass
         return False

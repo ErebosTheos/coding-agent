@@ -14,11 +14,12 @@ import json
 import os
 from typing import Optional
 
-from .models import Architecture, Plan
+from .models import Architecture, ExecutionResult, Plan
 from .executor import Executor
 from .planner_architect import COMBINED_SYSTEM_PROMPT, COMBINED_USER_PROMPT, PlannerArchitect
 from .utils import find_json_in_text, extract_code_from_markdown
 from .llm.protocol import LLMClient
+from .context_builder import ProjectContextBuilder
 
 
 class _NodeParser:
@@ -188,25 +189,23 @@ class StreamingPlanArchExecutor:
         plan = PlannerArchitect._parse_plan(data.get("plan", data))
         architecture = PlannerArchitect._parse_architecture(data.get("architecture", data))
 
+        # Build project_context.json from architecture before any code is written
+        if hasattr(self.executor, "workspace"):
+            ProjectContextBuilder(self.executor.workspace).build_from_architecture(architecture)
+
         print(
             f"  [StreamExecutor] Plan+Arch complete. "
             f"{len(architecture.nodes)} node(s). Executing (stream-bulk)..."
         )
 
-        # ── Phase 2: Execution strategy ─────────────────────────────────────
-        # Respect executor bulk threshold. This avoids one giant prompt for
-        # medium/large projects when max_bulk_files is lowered (or disabled).
+        from .executor import _ensure_language_boilerplate
         bulk_limit = getattr(self.executor, "max_bulk_files", 20)
-        use_stream_bulk = bulk_limit > 0 and len(architecture.nodes) <= bulk_limit
-
-        if use_stream_bulk:
-            # One LLM call for all files; files written as JSON values arrive.
+        if bulk_limit > 0 and len(architecture.nodes) <= bulk_limit:
             exec_result = await self.executor._stream_bulk(architecture)
         else:
-            # Defer to normal executor strategy (wave-based when bulk is disabled).
             exec_result = await self.executor.execute(architecture)
+
         if hasattr(self.executor, "workspace"):
-            from .executor import _ensure_language_boilerplate
             _ensure_language_boilerplate(self.executor.workspace, exec_result.generated_files)
 
         return plan, architecture, exec_result

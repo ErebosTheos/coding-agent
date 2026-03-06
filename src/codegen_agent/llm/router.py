@@ -19,6 +19,15 @@ try:
 except ImportError:
     HAS_YAML = False
 
+# Model tiers for within-role specialisation.
+# Keys: CODEGEN_FAST_PROVIDER / CODEGEN_FAST_MODEL   → used for "simple" nodes (boilerplate, schemas)
+#       CODEGEN_COMPLEX_PROVIDER / CODEGEN_COMPLEX_MODEL → used for "complex" nodes (auth, db, entrypoints)
+# If unset, the executor falls back to the standard role client.
+_TIER_ENV_KEYS = {
+    "simple":  ("CODEGEN_FAST_PROVIDER",    "CODEGEN_FAST_MODEL"),
+    "complex": ("CODEGEN_COMPLEX_PROVIDER", "CODEGEN_COMPLEX_MODEL"),
+}
+
 # Short alias → canonical provider name used in config
 _PROVIDER_ALIASES = {
     # Claude Code CLI binary (local, no API key needed)
@@ -66,6 +75,32 @@ def _load_dotenv(path: str = ".env") -> Dict[str, str]:
         value = value.strip().strip('"').strip("'")
         env[key] = value
     return env
+
+
+class _CharCountingClient:
+    """Thin pass-through wrapper that counts prompt + response chars on every live call."""
+
+    def __init__(self, client: LLMClient, char_counter=None):
+        self._client = client
+        self._counter = char_counter
+
+    def _track(self, prompt: str, response: str) -> None:
+        if self._counter is not None:
+            self._counter.total_prompt_chars += len(prompt)
+            self._counter.total_response_chars += len(response)
+            self._counter.total_llm_calls += 1
+
+    async def generate(self, prompt: str, system_prompt: str = "") -> str:
+        response = await self._client.generate(prompt, system_prompt=system_prompt)
+        self._track(prompt, response)
+        return response
+
+    async def astream(self, prompt: str, system_prompt: str = ""):
+        chunks: list[str] = []
+        async for chunk in self._client.astream(prompt, system_prompt=system_prompt):
+            chunks.append(chunk)
+            yield chunk
+        self._track(prompt, "".join(chunks))
 
 
 class _RetryingLLMClient:
@@ -168,6 +203,10 @@ class LLMRouter:
 
         self.config = self._load_config(config_path)
         self._clients: Dict[str, LLMClient] = {}
+        # Char counters — updated by every live (non-cached) LLM call
+        self.total_prompt_chars: int = 0
+        self.total_response_chars: int = 0
+        self.total_llm_calls: int = 0
 
     def _load_config(self, config_path: Optional[str]) -> Dict[str, Any]:
         # 1. Explicit config file (highest priority)
@@ -222,15 +261,19 @@ class LLMRouter:
             if use_cache:
                 cache_dir = os.path.join(".codegen_agent", "llm_cache")
                 cache = LLMCache(cache_dir)
-                call_client: LLMClient = CachingLLMClient(raw, cache, provider, model)
+                call_client: LLMClient = CachingLLMClient(raw, cache, provider, model, char_counter=self)
             else:
-                call_client = raw
+                call_client = _CharCountingClient(raw, char_counter=self)
+            call_fallback = (
+                _CharCountingClient(fallback_raw, char_counter=self)
+                if fallback_raw else None
+            )
             client = _RetryingLLMClient(
                 primary=raw,
                 role=role,
                 fallback=fallback_raw,
                 call_primary=call_client,
-                call_fallback=fallback_raw,
+                call_fallback=call_fallback,
             )
             self._clients[client_key] = client
 
@@ -261,6 +304,26 @@ class LLMRouter:
         provider = _PROVIDER_ALIASES.get(prov_raw, prov_raw)
         model = os.environ.get(env_model) or _DEFAULT_MODELS.get(provider)
         return self._create_client(provider, model)
+
+    def get_tier_clients(self, base_role: str) -> dict[str, LLMClient]:
+        """Return a dict of tier→LLMClient for within-role model specialisation.
+
+        Reads CODEGEN_FAST_PROVIDER/MODEL and CODEGEN_COMPLEX_PROVIDER/MODEL from the
+        environment. Only tiers that are explicitly configured are returned; the executor
+        falls back to its main client for any missing tier.
+        """
+        tier_clients: dict[str, LLMClient] = {}
+        for tier, (prov_key, model_key) in _TIER_ENV_KEYS.items():
+            prov_raw = os.environ.get(prov_key, "").lower().strip()
+            if not prov_raw:
+                continue
+            provider = _PROVIDER_ALIASES.get(prov_raw, prov_raw)
+            model = os.environ.get(model_key) or _DEFAULT_MODELS.get(provider)
+            try:
+                tier_clients[tier] = self._create_client(provider, model)
+            except ValueError:
+                pass  # unknown provider — skip this tier
+        return tier_clients
 
     async def execute_with_retry(
         self,

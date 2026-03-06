@@ -8,15 +8,34 @@ from .models import CommandResult
 
 _COMMAND_TIMEOUT = 120  # seconds; prevents hanging GUI/infinite-loop processes
 
+# Shell metacharacters that could chain or redirect commands unexpectedly.
+# Validation commands come from LLM-generated architecture plans, so we strip
+# anything that could turn `pytest` into `pytest; rm -rf /`.
+_SHELL_INJECT_RE = re.compile(r'[;&|`$<>]')
+
+
+def _sanitize_command(command: str) -> str:
+    """Remove shell injection metacharacters from a command string.
+
+    Keeps alphanumerics, spaces, hyphens, dots, slashes, colons, equals,
+    brackets, quotes, and underscores — enough for pytest/npm/go/cargo
+    invocations with flags, but strips `;`, `|`, `&&`, backticks, `$()`, etc.
+    """
+    return _SHELL_INJECT_RE.sub("", command).strip()
+
 
 def run_shell_command(command: str, cwd: Optional[str] = None) -> CommandResult:
     """Runs a shell command and returns a CommandResult.
 
     Enforces a hard timeout so GUI apps, infinite loops, or network-waiting
     processes cannot stall the healing loop indefinitely.
+
+    Uses shell=True for cross-platform PATH resolution but sanitizes the
+    command string first to strip shell injection metacharacters.
     """
+    safe_command = _sanitize_command(command)
     process = subprocess.Popen(
-        command,
+        safe_command,
         shell=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -35,7 +54,7 @@ def run_shell_command(command: str, cwd: Optional[str] = None) -> CommandResult:
             stderr=(stderr or "") + f"\n[Killed: command exceeded {_COMMAND_TIMEOUT}s timeout]",
         )
     return CommandResult(
-        command=command,
+        command=safe_command,
         exit_code=process.returncode,
         stdout=stdout,
         stderr=stderr,
@@ -88,6 +107,23 @@ def calculate_sha256(content: str) -> str:
 def ensure_directory(path: str):
     """Ensures that a directory exists."""
     os.makedirs(path, exist_ok=True)
+
+
+def resolve_workspace_path(workspace: str, rel_path: str) -> "Optional[Any]":
+    """Resolve rel_path relative to workspace, enforcing containment.
+
+    Returns the resolved ``pathlib.Path`` when the path is strictly inside
+    the workspace directory, or ``None`` if the path would escape it
+    (traversal attack, absolute path injection, null-byte trick, etc.).
+    """
+    from pathlib import Path as _Path
+    ws_root = _Path(workspace).resolve()
+    try:
+        candidate = (ws_root / rel_path).resolve()
+        candidate.relative_to(ws_root)
+        return candidate
+    except (ValueError, Exception):
+        return None
 
 
 def prune_prompt(prompt: str, max_chars: int = 32_000) -> str:

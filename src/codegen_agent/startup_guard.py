@@ -10,7 +10,6 @@ that import a known Python web framework (FastAPI, Flask, Django, Starlette, aio
 """
 import re
 import shlex
-import sys
 from pathlib import Path
 
 _FRAMEWORK_RE = re.compile(
@@ -31,6 +30,30 @@ _ENTRY_CANDIDATES = [
     "app/app.py",
 ]
 
+# Lines that indicate the file will block on import (e.g. uvicorn.run at module level).
+# We skip the smoke-check for these rather than hanging the healer.
+_BLOCKING_PATTERNS = re.compile(
+    r"^\s*(uvicorn\.run|app\.run|asyncio\.run|loop\.run_until_complete)\s*\(",
+    re.MULTILINE,
+)
+
+
+def _resolve_python(workspace: str) -> str:
+    """Return the Python binary to use for the smoke-check.
+
+    Prefers a virtualenv inside the project workspace (.venv, venv, env) so
+    the import runs against the project's installed dependencies — not the
+    agent's own environment.
+    """
+    ws = Path(workspace)
+    for venv_name in (".venv", "venv", "env"):
+        candidate = ws / venv_name / "bin" / "python"
+        if candidate.exists():
+            return shlex.quote(str(candidate))
+    # Fall back to bare `python3` so PATH resolution picks up whatever is
+    # active in the shell — still better than the agent's sys.executable.
+    return "python3"
+
 
 def detect_entry_point(generated_files, workspace: str) -> str | None:
     """Return the relative path of the web app entry point, or None.
@@ -38,6 +61,9 @@ def detect_entry_point(generated_files, workspace: str) -> str | None:
     Only activates when at least one generated Python file imports a known
     web framework — avoids injecting import checks for CLI scripts, data
     pipelines, or non-Python projects.
+
+    Also skips entry points that call blocking functions at module level
+    (e.g. ``uvicorn.run()``) — those would hang the smoke-check.
     """
     is_web = any(
         _FRAMEWORK_RE.search(f.content)
@@ -48,17 +74,30 @@ def detect_entry_point(generated_files, workspace: str) -> str | None:
         return None
 
     for candidate in _ENTRY_CANDIDATES:
-        if Path(workspace, candidate).exists():
+        p = Path(workspace, candidate)
+        if p.exists():
+            try:
+                src = p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if _BLOCKING_PATTERNS.search(src):
+                # Entry point calls uvicorn.run / app.run at module level —
+                # importing it would block indefinitely. Skip it.
+                continue
             return candidate
 
     return None
 
 
-def build_import_check_command(entry_point: str) -> str:
+def build_import_check_command(entry_point: str, workspace: str = ".") -> str:
     """Return ``python -c "import <module>"`` for the given entry-point path.
 
     Converts ``src/main.py`` → ``import src.main`` so the check runs from the
     project root (the cwd used by all validation commands).
+
+    Uses the project's own virtualenv Python when available so the import
+    resolves against the project's installed packages, not the agent's venv.
     """
     module = entry_point.replace("\\", "/").replace("/", ".").removesuffix(".py")
-    return f"{shlex.quote(sys.executable)} -c {shlex.quote(f'import {module}')}"
+    python = _resolve_python(workspace)
+    return f"{python} -c {shlex.quote(f'import {module}')}"

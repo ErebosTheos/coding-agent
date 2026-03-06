@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Drishtikon Foundation | Inclusive Learning Management System</title>
+  <meta name="description" content="Empowering visually impaired learners through accessible technical education, mobility training, and life skills.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #09090b; --surface: #18181b; --surface-2: #27272a; --border: #3f3f46;
+      --primary: #6366f1; --primary-hover: #4f46e5; --primary-glow: rgba(99,102,241,0.3);
+      --accent: #8b5cf6; --success: #22c55e; --warning: #f59e0b; --danger: #ef4444;
+      --text: #fafafa; --text-muted: #a1a1aa; --text-subtle: #52525b;
+      --radius: 12px; --radius-sm: 8px; --shadow: 0 4px 24px rgba(0,0,0,0.5);
+      --font: 'Inter', system-ui, sans-serif; --transition: all 0.2s cubic-bezier(0.4,0,0.2,1);
+      --base-font-size: 16px;
+    }
+
+    /* Accessibility Modifiers */
+    html.high-contrast {
+      --bg: #000000; --surface: #000000; --surface-2: #111111; --border: #ffffff;
+      --primary: #ffff00; --primary-hover: #ffff00; --text: #ffffff; --text-muted: #ffffff;
+      --text-subtle: #ffffff;
+    }
+    html.dyslexic {
+      --font: 'OpenDyslexic', 'Comic Sans MS', sans-serif;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background-color: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: var(--base-font-size);
+      line-height: 1.6;
+      overflow-x: hidden;
+      scroll-behavior: smooth;
+    }
+
+    .skip-to-content {
+      position: absolute; left: -10000px; top: auto; width: 1px; height: 1px; overflow: hidden;
+    }
+    .skip-to-content:focus {
+      position: fixed; top: 1rem; left: 1rem; z-index: 1000; background: var(--primary);
+      color: white; padding: 1rem; border-radius: var(--radius-sm); width: auto; height: auto;
+    }
+
+    /* Navbar */
+    .navbar {
+      position: sticky; top: 0; z-index: 100;
+      background: rgba(9, 9, 11, 0.8);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border);
+      padding: 1rem 2rem;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .nav-brand {
+      font-weight: 800; font-size: 1.5rem; letter-spacing: -0.025em; color: var(--text);
+      display: flex; align-items: center; gap: 0.5rem; text-decoration: none;
+    }
+    .nav-brand span { color: var(--primary); }
+    .nav-links { display: flex; gap: 2rem; align-items: center; }
+    .nav-link {
+      text-decoration: none; color: var(--text-muted); font-weight: 500;
+      transition: var(--transition); font-size: 0.9375rem;
+    }
+    .nav-link:hover { color: var(--text); }
+    
+    .nav-actions { display: flex; gap: 1rem; align-items: center; }
+    .a11y-group {
+      display: flex; gap: 0.5rem; border-right: 1px solid var(--border);
+      padding-right: 1rem; margin-right: 0.5rem;
+    }
+
+    /* Buttons */
+    .btn {
+      padding: 0.625rem 1.25rem; border-radius: var(--radius-sm); font-weight: 600;
+      cursor: pointer; transition: var(--transition); border: 1px solid transparent;
+      text-decoration: none; display: inline-flex; align-items: center; justify-content: center;
+      font-size: 0.875rem;
+    }
+    .btn-primary { background: var(--primary); color: white; box-shadow: 0 0 20px var(--primary-glow); }
+    .btn-primary:hover { background: var(--primary-hover); transform: translateY(-1px); }
+    .btn-outline { background: transparent; border-color: var(--border); color: var(--text); }
+    .btn-outline:hover { background: var(--surface-2); border-color: var(--text-muted); }
+    .btn-icon {
+      width: 36px; height: 36px; padding: 0; background: var(--surface); border: 1px solid var(--border);
+      color: var(--text-muted); border-radius: var(--radius-sm);
+    }
+    .btn-icon:hover { color: var(--text); border-color: var(--primary); }
+
+    /* Hero */
+    .hero {
+      min-height: 90vh; display: flex; flex-direction: column; align-items: center;
+      justify-content: center; text-align: center; padding: 4rem 2rem;
+      position: relative; overflow: hidden;
+      background: radial-gradient(circle at 50% 50%, rgba(99, 102, 241, 0.15) 0%, rgba(9, 9, 11, 1) 70%);
+    }
+    .hero::before {
+      content: ''; position: absolute; width: 200%; height: 200%;
+      background: url('https://www.transparenttextures.com/patterns/carbon-fibre.png');
+      opacity: 0.05; animation: move 60s linear infinite; pointer-events: none;
+    }
+    @keyframes move { from { transform: translate(0,0); } to { transform: translate(-50%, -50%); } }
+
+    .hero-content { max-width: 900px; position: relative; z-index: 1; }
+    .hero-title {
+      font-size: clamp(2.5rem, 8vw, 4.5rem); line-height: 1.1; font-weight: 800;
+      letter-spacing: -0.04em; margin-bottom: 1.5rem;
+      background: linear-gradient(to right, #fff, #a1a1aa);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    }
+    .hero-subtitle {
+      font-size: 1.25rem; color: var(--text-muted); margin-bottom: 2.5rem;
+      max-width: 600px; margin-inline: auto;
+    }
+    .hero-btns { display: flex; gap: 1rem; justify-content: center; }
+
+    /* Stats Bar */
+    .stats-bar {
+      background: var(--surface); border-y: 1px solid var(--border);
+      padding: 3rem 2rem; display: grid; grid-template-columns: repeat(4, 1fr);
+      max-width: 1200px; margin: 0 auto; border-radius: var(--radius);
+      margin-top: -4rem; position: relative; z-index: 10;
+    }
+    .stat-item { text-align: center; border-right: 1px solid var(--border); }
+    .stat-item:last-child { border: none; }
+    .stat-value { font-size: 2.5rem; font-weight: 800; color: var(--primary); display: block; }
+    .stat-label { color: var(--text-muted); font-size: 0.875rem; text-transform: uppercase; letter-spacing: 0.1em; }
+
+    /* Sections */
+    section { padding: 8rem 2rem; max-width: 1200px; margin: 0 auto; }
+    .section-header { margin-bottom: 4rem; text-align: center; }
+    .section-title { font-size: 2.5rem; font-weight: 700; margin-bottom: 1rem; }
+    .section-desc { color: var(--text-muted); max-width: 600px; margin: 0 auto; }
+
+    /* Programs Grid */
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 2rem; }
+    .card {
+      background: var(--surface); border: 1px solid var(--border); padding: 2rem;
+      border-radius: var(--radius); transition: var(--transition); position: relative;
+    }
+    .card:hover { border-color: var(--primary); transform: translateY(-4px); box-shadow: var(--shadow); }
+    .card-icon {
+      width: 48px; height: 48px; background: var(--surface-2); border-radius: var(--radius-sm);
+      display: flex; align-items: center; justify-content: center; margin-bottom: 1.5rem;
+      color: var(--primary);
+    }
+    .card-title { font-size: 1.25rem; font-weight: 600; margin-bottom: 0.75rem; }
+    .card-text { color: var(--text-muted); font-size: 0.9375rem; margin-bottom: 1.5rem; }
+    .card-meta { display: flex; justify-content: space-between; align-items: center; padding-top: 1rem; border-top: 1px solid var(--border); font-size: 0.8125rem; color: var(--text-subtle); }
+
+    /* Testimonials */
+    .testimonial-card {
+      background: var(--surface-2); padding: 2.5rem; border-radius: var(--radius);
+      position: relative;
+    }
+    .quote-icon { font-size: 3rem; color: var(--primary); opacity: 0.2; position: absolute; top: 1rem; right: 1rem; }
+    .testimonial-text { font-style: italic; margin-bottom: 1.5rem; position: relative; z-index: 1; }
+    .user-info { display: flex; align-items: center; gap: 1rem; }
+    .avatar { width: 44px; height: 44px; background: var(--primary); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 700; }
+
+    /* Team */
+    .team-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 2.5rem; }
+    .member-card { text-align: center; }
+    .member-img {
+      width: 120px; height: 120px; background: var(--surface-2); border-radius: 50%;
+      margin: 0 auto 1.5rem; display: flex; align-items: center; justify-content: center;
+      font-size: 2.5rem; color: var(--text-muted); border: 2px solid var(--border);
+    }
+    .member-name { font-size: 1.125rem; font-weight: 600; }
+    .member-role { color: var(--primary); font-size: 0.875rem; margin-bottom: 1rem; display: block; }
+    .member-bio { font-size: 0.875rem; color: var(--text-muted); }
+
+    /* Donation */
+    .donation-section { background: var(--surface); border-radius: var(--radius); padding: 4rem; border: 1px solid var(--border); margin-bottom: 4rem; }
+    .progress-container { margin: 2rem 0; }
+    .progress-bar { height: 12px; background: var(--surface-2); border-radius: 10px; overflow: hidden; position: relative; }
+    .progress-fill { height: 100%; background: linear-gradient(to right, var(--primary), var(--accent)); width: 65%; }
+    .progress-stats { display: flex; justify-content: space-between; margin-top: 0.75rem; font-weight: 600; }
+
+    /* Contact */
+    .contact-container { display: grid; grid-template-columns: 1fr 1.5fr; gap: 4rem; }
+    .contact-info-list { list-style: none; margin-top: 2rem; }
+    .contact-info-list li { margin-bottom: 1.5rem; display: flex; gap: 1rem; color: var(--text-muted); }
+    .contact-info-list b { color: var(--text); display: block; margin-bottom: 0.25rem; }
+    
+    .contact-form { background: var(--surface-2); padding: 2.5rem; border-radius: var(--radius); border: 1px solid var(--border); }
+    .form-group { margin-bottom: 1.5rem; }
+    .form-group label { display: block; margin-bottom: 0.5rem; font-size: 0.875rem; color: var(--text-muted); }
+    .form-control {
+      width: 100%; background: var(--surface); border: 1px solid var(--border);
+      padding: 0.75rem 1rem; color: var(--text); border-radius: var(--radius-sm);
+      font-family: inherit; transition: var(--transition);
+    }
+    .form-control:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-glow); }
+
+    /* Footer */
+    footer { border-top: 1px solid var(--border); padding: 6rem 2rem 2rem; background: #050505; }
+    .footer-content {
+      max-width: 1200px; margin: 0 auto; display: grid; grid-template-columns: 1.5fr 1fr 1fr 1fr; gap: 4rem;
+      margin-bottom: 4rem;
+    }
+    .footer-logo { font-size: 1.5rem; font-weight: 800; margin-bottom: 1.5rem; display: block; text-decoration: none; color: white; }
+    .footer-desc { color: var(--text-muted); font-size: 0.9375rem; line-height: 1.7; }
+    .footer-title { font-weight: 700; margin-bottom: 1.5rem; text-transform: uppercase; font-size: 0.75rem; letter-spacing: 0.1em; color: var(--text-subtle); }
+    .footer-links { list-style: none; }
+    .footer-links li { margin-bottom: 0.75rem; }
+    .footer-links a { text-decoration: none; color: var(--text-muted); transition: var(--transition); font-size: 0.875rem; }
+    .footer-links a:hover { color: var(--primary); }
+    .footer-bottom {
+      max-width: 1200px; margin: 0 auto; border-top: 1px solid var(--border); padding-top: 2rem;
+      display: flex; justify-content: space-between; align-items: center; color: var(--text-subtle); font-size: 0.875rem;
+    }
+
+    @media (max-width: 768px) {
+      .nav-links, .a11y-group { display: none; }
+      .stats-bar { grid-template-columns: 1fr 1fr; gap: 2rem; }
+      .team-grid { grid-template-columns: 1fr; }
+      .contact-container { grid-template-columns: 1fr; }
+      .footer-content { grid-template-columns: 1fr 1fr; gap: 2.5rem; }
+    }
+  </style>
+</head>
+<body>
+
+  <a href="#main-content" class="skip-to-content">Skip to content</a>
+
+  <nav class="navbar" role="navigation" aria-label="Main Navigation">
+    <a href="/" class="nav-brand">DRISHTIKON<span>FOUNDATION</span></a>
+    
+    <div class="nav-links">
+      <a href="#programs" class="nav-link">Programs</a>
+      <a href="#impact" class="nav-link">Success Stories</a>
+      <a href="#about" class="nav-link">About</a>
+      <a href="#team" class="nav-link">Staff</a>
+      <a href="#contact" class="nav-link">Contact</a>
+    </div>
+
+    <div class="nav-actions">
+      <div class="a11y-group" aria-label="Accessibility Controls">
+        <button onclick="toggleContrast()" class="btn-icon" title="Toggle High Contrast" aria-label="High Contrast Mode">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22c5.523 0 10-4.477 10-10S17.523 2 12 2 2 6.477 2 12s4.477 10 10 10z"/><path d="M12 18a6 6 0 100-12v12z"/></svg>
+        </button>
+        <button onclick="toggleDyslexia()" class="btn-icon" title="Dyslexia Friendly Font" aria-label="Toggle Dyslexic Font">Aa</button>
+        <button onclick="changeFontSize(1)" class="btn-icon" title="Increase Font Size" aria-label="Increase Font Size">A+</button>
+        <button onclick="changeFontSize(-1)" class="btn-icon" title="Decrease Font Size" aria-label="Decrease Font Size">A-</button>
+      </div>
+      <a href="login.html" class="btn btn-primary">LMS Login</a>
+    </div>
+  </nav>
+
+  <main id="main-content">
+    
+    <section class="hero" id="home">
+      <div class="hero-content">
+        <h1 class="hero-title">Education that sees <br>beyond boundaries.</h1>
+        <p class="hero-subtitle">
+          A high-performance Learning Management System dedicated to empowering the visually impaired with world-class technical and vocational skills.
+        </p>
+        <div class="hero-btns">
+          <a href="#programs" class="btn btn-primary">View Courses</a>
+          <a href="#contact" class="btn btn-outline">Register as Volunteer</a>
+        </div>
+      </div>
+    </section>
+
+    <div class="stats-bar">
+      <div class="stat-item">
+        <span class="stat-value">5,200+</span>
+        <span class="stat-label">Learners</span>
+      </div>
+      <div class="stat-item">
+        <span class="stat-value">145</span>
+        <span class="stat-label">Modules</span>
+      </div>
+      <div class="stat-item">
+        <span class="stat-value">12</span>
+        <span class="stat-label">Active Years</span>
+      </div>
+      <div class="stat-item">
+        <span class="stat-value">840+</span>
+        <span class="stat-label">Volunteers</span>
+      </div>
+    </div>
+
+    <section id="programs">
+      <div class="section-header">
+        <h2 class="section-title">Academic Programs</h2>
+        <p class="section-desc">Specialized curriculum designed for accessibility first, ensuring no student is left behind in the digital era.</p>
+      </div>
+      <div class="grid">
+        <article class="card">
+          <div class="card-icon">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+          </div>
+          <h3 class="card-title">Computer Fundamentals</h3>
+          <p class="card-text">Mastering Screen Readers (JAWS/NVDA), advanced keyboard navigation, and office productivity tools.</p>
+          <div class="card-meta">
+            <span>12 Modules</span>
+            <span>48 Lessons</span>
+          </div>
+        </article>
+
+        <article class="card">
+          <div class="card-icon">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 19l7-7 3 3-7 7-3-3z"/><path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z"/><path d="M2 2l7.5 1.5"/><path d="M14 11l7 7"/></svg>
+          </div>
+          <h3 class="card-title">Mobility Training</h3>
+          <p class="card-text">Orientation and independent travel skills using white canes and modern GPS-assisted navigation tools.</p>
+          <div class="card-meta">
+            <span>6 Modules</span>
+            <span>24 Lessons</span>
+          </div>
+        </article>
+
+        <article class="card">
+          <div class="card-icon">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          </div>
+          <h3 class="card-title">Spoken English</h3>
+          <p class="card-text">Phonetics-based English proficiency training to enhance professional communication and confidence.</p>
+          <div class="card-meta">
+            <span>15 Modules</span>
+            <span>60 Lessons</span>
+          </div>
+        </article>
+
+        <article class="card">
+          <div class="card-icon">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+          </div>
+          <h3 class="card-title">Life Skills</h3>
+          <p class="card-text">Financial literacy, soft skills, and daily living activities tailored for complete social integration.</p>
+          <div class="card-meta">
+            <span>8 Modules</span>
+            <span>32 Lessons</span>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <section id="impact" style="background: rgba(99,102,241,0.03); border-radius: var(--radius);">
+      <div class="section-header">
+        <h2 class="section-title">Success Stories</h2>
+        <p class="section-desc">Witness the transformative journey of our alumni who are now leading successful careers in top industries.</p>
+      </div>
+      <div class="grid">
+        <div class="testimonial-card">
+          <span class="quote-icon">“</span>
+          <p class="testimonial-text">Drishtikon didn't just teach me how to use a computer; they gave me a career. I am now a software accessibility tester at a global firm.</p>
+          <div class="user-info">
+            <div class="avatar">RK</div>
+            <div>
+              <strong>Ravi Kumar</strong>
+              <div style="font-size: 0.8125rem; color: var(--primary);">Class of 2023</div>
+            </div>
+          </div>
+        </div>
+        <div class="testimonial-card">
+          <span class="quote-icon">“</span>
+          <p class="testimonial-text">The mobility training changed my life. Being able to navigate the city independently to reach my office is a freedom I never expected.</p>
+          <div class="user-info">
+            <div class="avatar">PA</div>
+            <div>
+              <strong>Priya Anand</strong>
+              <div style="font-size: 0.8125rem; color: var(--primary);">Class of 2022</div>
+            </div>
+          </div>
+        </div>
+        <div class="testimonial-card">
+          <span class="quote-icon">“</span>
+          <p class="testimonial-text">Their spoken English course gave me the confidence to clear bank interviews. Today, I am working as a Customer Service Manager.</p>
+          <div class="user-info">
+            <div class="avatar">AM</div>
+            <div>
+              <strong>Anita Mishra</strong>
+              <div style="font-size: 0.8125rem; color: var(--primary);">Class of 2024</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="team">
+      <div class="section-header">
+        <h2 class="section-title">Our Leadership</h2>
+        <p class="section-desc">Guided by experts in disability education and technical training.</p>
+      </div>
+      <div class="team-grid">
+        <div class="member-card">
+          <div class="member-img">S</div>
+          <h4 class="member-name">Dr. S. K. Sharma</h4>
+          <span class="member-role">Founder & Director</span>
+          <p class="member-bio">30+ years experience in Inclusive Education and Policy Making for the Visually Impaired.</p>
+        </div>
+        <div class="member-card">
+          <div class="member-img">M</div>
+          <h4 class="member-name">Meera Vasisht</h4>
+          <span class="member-role">Head of Academics</span>
+          <p class="member-bio">Specialized in curriculum design for assistive technologies and pedagogical accessibility.</p>
+        </div>
+        <div class="member-card">
+          <div class="member-img">R</div>
+          <h4 class="member-name">Rahul Deshmukh</h4>
+          <span class="member-role">IT & Operations</span>
+          <p class="member-bio">Managing the core LMS architecture and ensuring seamless delivery of digital materials.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="donation">
+      <div class="donation-section">
+        <h2 class="section-title" style="text-align: left;">Support Our Mission</h2>
+        <p class="section-desc" style="text-align: left; margin-left: 0;">We are currently raising funds for our New Digital Braille Library. Your contribution helps us purchase refreshable Braille displays for 50 students.</p>
+        
+        <div class="progress-container">
+          <div class="progress-bar">
+            <div class="progress-fill"></div>
+          </div>
+          <div class="progress-stats">
+            <span>Raised: ₹3,25,000</span>
+            <span>Goal: ₹5,00,000</span>
+          </div>
+        </div>
+        
+        <button class="btn btn-primary" style="padding: 1rem 2rem;">Donate to the Cause</button>
+      </div>
+    </section>
+
+    <section id="contact">
+      <div class="contact-container">
+        <div>
+          <h2 class="section-title" style="text-align: left;">Get in Touch</h2>
+          <p class="section-desc" style="text-align: left; margin-left: 0; margin-bottom: 2rem;">Have questions about our programs or wish to partner with us? Reach out today.</p>
+          
+          <ul class="contact-info-list">
+            <li>
+              <div class="btn-icon" style="flex-shrink: 0;"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg></div>
+              <div><b>Address</b> 42, Knowledge Park, Sector V, New Delhi, India 110001</div>
+            </li>
+            <li>
+              <div class="btn-icon" style="flex-shrink: 0;"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/></svg></div>
+              <div><b>Phone</b> +91 11 2345 6789</div>
+            </li>
+            <li>
+              <div class="btn-icon" style="flex-shrink: 0;"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg></div>
+              <div><b>Email</b> contact@drishtikon.org</div>
+            </li>
+          </ul>
+        </div>
+
+        <form class="contact-form" onsubmit="return false;">
+          <div class="grid" style="grid-template-columns: 1fr 1fr; margin-bottom: 0;">
+            <div class="form-group">
+              <label for="name">Full Name</label>
+              <input type="text" id="name" class="form-control" placeholder="Enter your name" required>
+            </div>
+            <div class="form-group">
+              <label for="email">Email Address</label>
+              <input type="email" id="email" class="form-control" placeholder="your@email.com" required>
+            </div>
+          </div>
+          <div class="form-group">
+            <label for="subject">Inquiry Type</label>
+            <select id="subject" class="form-control">
+              <option>General Inquiry</option>
+              <option>Student Enrollment</option>
+              <option>Volunteer Registration</option>
+              <option>Technical Support</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="message">Message</label>
+            <textarea id="message" rows="5" class="form-control" placeholder="How can we help you?"></textarea>
+          </div>
+          <button type="submit" class="btn btn-primary" style="width: 100%;">Send Message</button>
+        </form>
+      </div>
+    </section>
+
+  </main>
+
+  <footer>
+    <div class="footer-content">
+      <div>
+        <a href="#" class="footer-logo">DRISHTIKON</a>
+        <p class="footer-desc">Drishtikon Foundation is a non-profit organization dedicated to bridging the digital divide for visually impaired individuals through specialized training and accessible technology.</p>
+      </div>
+      <div>
+        <h5 class="footer-title">Navigation</h5>
+        <ul class="footer-links">
+          <li><a href="#home">Home</a></li>
+          <li><a href="#programs">Courses</a></li>
+          <li><a href="#impact">Alumni Stories</a></li>
+          <li><a href="#about">Our Mission</a></li>
+        </ul>
+      </div>
+      <div>
+        <h5 class="footer-title">Resources</h5>
+        <ul class="footer-links">
+          <li><a href="#">Annual Reports</a></li>
+          <li><a href="#">Screen Reader Tips</a></li>
+          <li><a href="#">A11y Standards</a></li>
+          <li><a href="#">FAQ</a></li>
+        </ul>
+      </div>
+      <div>
+        <h5 class="footer-title">Community</h5>
+        <ul class="footer-links">
+          <li><a href="#">Volunteer Portal</a></li>
+          <li><a href="#">Corporate Partners</a></li>
+          <li><a href="#">Donation Center</a></li>
+          <li><a href="#">Privacy Policy</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <p>&copy; 2026 Drishtikon Foundation. Registered NGO. All Rights Reserved.</p>
+      <div style="display: flex; gap: 1.5rem;">
+        <a href="#" aria-label="LinkedIn" class="nav-link">LinkedIn</a>
+        <a href="#" aria-label="Twitter" class="nav-link">Twitter</a>
+        <a href="#" aria-label="YouTube" class="nav-link">YouTube</a>
+      </div>
+    </div>
+  </footer>
+
+  <script>
+    let currentFontSize = 16;
+    const html = document.documentElement;
+
+    function toggleContrast() {
+      html.classList.toggle('high-contrast');
+      localStorage.setItem('highContrast', html.classList.contains('high-contrast'));
+    }
+
+    function toggleDyslexia() {
+      html.classList.toggle('dyslexic');
+      localStorage.setItem('dyslexic', html.classList.contains('dyslexic'));
+    }
+
+    function changeFontSize(delta) {
+      currentFontSize = Math.min(Math.max(currentFontSize + (delta * 2), 12), 32);
+      html.style.setProperty('--base-font-size', currentFontSize + 'px');
+      localStorage.setItem('fontSize', currentFontSize);
+    }
+
+    // Load preferences
+    window.addEventListener('DOMContentLoaded', () => {
+      if (localStorage.getItem('highContrast') === 'true') html.classList.add('high-contrast');
+      if (localStorage.getItem('dyslexic') === 'true') html.classList.add('dyslexic');
+      const savedFontSize = localStorage.getItem('fontSize');
+      if (savedFontSize) {
+        currentFontSize = parseInt(savedFontSize);
+        html.style.setProperty('--base-font-size', savedFontSize + 'px');
+      }
+    });
+  </script>
+</body>
+</html>

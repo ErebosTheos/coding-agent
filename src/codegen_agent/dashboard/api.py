@@ -1,7 +1,11 @@
 """Dashboard REST API endpoints."""
 from __future__ import annotations
 
+import logging
 import time
+import uuid
+
+log = logging.getLogger(__name__)
 from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
@@ -61,7 +65,7 @@ async def global_stats():
 async def list_projects():
     projects = await _reg().all_projects()
     result = []
-    for p in sorted(projects, key=lambda x: -(x._data.get("updated_at") or 0)):
+    for p in sorted(projects, key=lambda x: -x.updated_at):
         result.append({
             "id": p.id,
             "name": p.brief.get("name", p.id),
@@ -117,8 +121,8 @@ async def get_project(project_id: str):
                     "description": report.prompt[:300],
                     "features": [f.title for f in (report.plan.features or [])],
                 })
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("Failed to enrich project %s detail: %s", project_id, exc)
 
     # Git log
     git_log: list[dict] = []
@@ -127,8 +131,8 @@ async def get_project(project_id: str):
         src = str(_reg().src_dir(project_id))
         gm = GitManager(project_id, src)
         git_log = await gm.log(20)
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("Could not load git log for %s: %s", project_id, exc)
 
     return {
         "id": p.id,
@@ -173,14 +177,17 @@ async def submit_project(
         # Write to inbox so the watcher picks it up
         inbox = Path(_inbox_dir)
         inbox.mkdir(parents=True, exist_ok=True)
-        dest = inbox / file.filename
+        stem = Path(file.filename).stem
+        suffix = Path(file.filename).suffix.lower()
+        safe_name = f"{stem}-{int(time.time())}-{uuid.uuid4().hex[:6]}{suffix}"
+        dest = inbox / safe_name
         dest.write_bytes(raw)
-        brief_name = file.filename
+        brief_name = safe_name
     elif text and text.strip():
         inbox = Path(_inbox_dir)
         inbox.mkdir(parents=True, exist_ok=True)
         ts = int(time.time())
-        dest = inbox / f"brief-{ts}.txt"
+        dest = inbox / f"brief-{ts}-{uuid.uuid4().hex[:6]}.txt"
         dest.write_text(text.strip(), encoding="utf-8")
         brief_name = dest.name
     else:
@@ -208,7 +215,13 @@ async def retry_project(project_id: str):
         raise HTTPException(status_code=404, detail="not found")
 
     from .server import _run_bugfix_docs
-    asyncio.create_task(_run_bugfix_docs(p, _reg().src_dir(project_id)))
+    src_dir = _reg().src_dir(project_id)
+    if _pool:
+        asyncio.create_task(
+            _pool.run(project_id, lambda: _run_bugfix_docs(p, src_dir))
+        )
+    else:
+        asyncio.create_task(_run_bugfix_docs(p, src_dir))
     return {"status": "retrying", "id": project_id}
 
 

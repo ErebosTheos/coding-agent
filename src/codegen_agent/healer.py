@@ -9,11 +9,25 @@ from .models import HealingReport, HealAttempt, FailureType
 from .llm.protocol import LLMClient
 from .classifier import classify_failure
 from .patch_cache import PatchCache
-from .utils import run_shell_command, extract_code_from_markdown, prune_prompt, find_json_in_text
+from .pattern_store import PatternStore
+from .pytest_parser import (
+    run_pytest_structured,
+    format_structured_failures_for_prompt,
+    PytestReport,
+)
+from .utils import run_shell_command, extract_code_from_markdown, prune_prompt, find_json_in_text, resolve_workspace_path
 
 logger = logging.getLogger(__name__)
 
 HEALER_SYSTEM_PROMPT = """You are an expert Software Engineer specializing in debugging and fixing code.
+
+ANTI-TRUNCATION MANDATE (enforced by automated validator — truncated output is DISCARDED):
+- Return the COMPLETE corrected file — every single line from the first to the last.
+- If the file is 400 lines, your output must be ~400 lines. Never cut off mid-function.
+- An automated check compares your output length to the original. If your output is <60%
+  of the original length it is REJECTED and the file stays broken. Write it ALL.
+- NEVER end your response with a partial line, hanging indent, or incomplete expression.
+- Do NOT truncate or summarise the unchanged parts. Copy them verbatim.
 
 CRITICAL RULES — violating any of these makes the fix worse than the original:
 - Fix ONLY the specific error shown. Do NOT refactor, rename, or restructure surrounding code.
@@ -22,7 +36,6 @@ CRITICAL RULES — violating any of these makes the fix worse than the original:
 - If fixing an ImportError or NameError: look at the "Related files" section to find what
   is actually exported before writing any import statement.
 - If fixing a missing import: add it to the existing import block, do not rewrite the whole file.
-- Return the COMPLETE corrected file content — not a diff, not a partial excerpt.
 - No markdown fences, no commentary, no explanations before or after the code."""
 
 HEALER_USER_PROMPT_TEMPLATE = """Failing command: {command}
@@ -97,6 +110,71 @@ _ASYNC_FIXTURE_RE = re.compile(
     re.MULTILINE,
 )
 _PYTEST_ASYNCIO_IMPORT_RE = re.compile(r"^\s*import\s+pytest_asyncio", re.MULTILINE)
+
+# ── Healer output validation ────────────────────────────────────────────────────
+# Same truncation patterns as TruncationGuard in executor.py.
+# A healer that writes truncated output is worse than no fix at all.
+_HEALER_TRUNC_BRACKET_RE = re.compile(r'^\s*\[\.{2,}[^\]\n]*\]\s*$', re.MULTILINE)
+# Lone indented identifier at EOF — potential mid-word truncation
+_HEALER_MIDWORD_RE = re.compile(r'\n([ \t]+)([a-z_][a-z0-9_]*)\s*$')
+# Partial assignment value at EOF, e.g. `    default=F` (False cut to F)
+_HEALER_MIDASSIGN_RE = re.compile(r'\n[ \t]+\w+\s*=\s*[A-Z]\w{0,4}\s*$')
+# Python keywords that are valid as the last token — not mid-word truncation
+_HEALER_VALID_LAST_WORDS = frozenset({
+    'pass', 'return', 'break', 'continue', 'else', 'finally', 'raise', 'yield',
+    'true', 'false', 'none', 'and', 'or', 'not', 'in', 'is',
+})
+# Shrink threshold: reject fix if output is < 60% of original line count
+_HEALER_SHRINK_RATIO = 0.60
+
+
+def _is_healer_output_truncated(content: str) -> bool:
+    """True if healer output appears LLM-truncated (mirrors executor._is_content_truncated)."""
+    if bool(_HEALER_TRUNC_BRACKET_RE.search(content)):
+        return True
+    if bool(_HEALER_MIDASSIGN_RE.search(content)):
+        return True
+    m = _HEALER_MIDWORD_RE.search(content)
+    if m:
+        word = m.group(2).lower()
+        if word not in _HEALER_VALID_LAST_WORDS:
+            return True
+    return False
+
+
+# Agent-internal strings that indicate a file has been corrupted by injection.
+# When the ORIGINAL file has these, the fix is expected to be much smaller — skip shrink check.
+_AGENT_INJECTION_MARKERS = frozenset({
+    "CachingLLMClient", "LLMRouter", "get_client_for_role", "HEALER_SYSTEM_PROMPT",
+    "EXECUTOR_SYSTEM_PROMPT", "PlannerArchitect", "StreamingPlanArchExecutor",
+    "from .caching_client import", "_BulkFileParser", "HealingReport", "ExecutionNode",
+})
+
+
+def _original_has_injection(original: str) -> bool:
+    return any(marker in original for marker in _AGENT_INJECTION_MARKERS)
+
+
+def _healer_output_ok(fixed: str, original: str) -> bool:
+    """Return True if the healer's fixed content is valid and safe to write.
+
+    Rejects output that is:
+    - Truncated mid-word  (e.g. last line is `    to_enc`)
+    - Contains [...] placeholder
+    - More than 40% shorter than the original (unless the original was itself injected/bloated)
+    """
+    if not fixed or not fixed.strip():
+        return False
+    if _is_healer_output_truncated(fixed):
+        return False
+    if original:
+        orig_lines = original.count('\n') + 1
+        fix_lines  = fixed.count('\n') + 1
+        # Skip shrink ratio when the original was corrupted by injection — fix is expected to be smaller
+        if orig_lines > 30 and fix_lines < orig_lines * _HEALER_SHRINK_RATIO:
+            if not _original_has_injection(original):
+                return False
+    return True
 
 # Failure patterns that indicate test-infrastructure problems (not logic bugs).
 # For these the healer should temporarily edit test files.
@@ -336,6 +414,8 @@ class Healer:
         # Model identifier for cache key hardening
         _model_attr = getattr(llm_client, "model", None) or getattr(llm_client, "_model", None)
         self._model_id: str = str(_model_attr) if _model_attr else ""
+        # Cross-project pattern store: failure fingerprint → successful fix description
+        self._pattern_store = PatternStore()
 
     async def heal(self, validation_commands: List[str]) -> HealingReport:
         """Run tests → extract ALL broken files → fix in parallel → repeat."""
@@ -347,12 +427,26 @@ class Healer:
 
         for attempt_num in range(1, self.max_attempts + 1):
             commands = _consolidate_commands(validation_commands)
+
+            # Run all commands; for pytest commands also collect structured JSON report
             run_tasks = [
                 asyncio.to_thread(run_shell_command, cmd, cwd=self.workspace)
                 for cmd in commands
             ]
-            results = await asyncio.gather(*run_tasks)
+            # Run structured pytest in parallel with the plain run_tasks
+            structured_tasks = [
+                run_pytest_structured(cmd, self.workspace) for cmd in commands
+            ]
+            results, structured_results = await asyncio.gather(
+                asyncio.gather(*run_tasks),
+                asyncio.gather(*structured_tasks),
+            )
             last_failures = [r for r in results if r.exit_code != 0]
+            # Merge structured reports: pick the first non-None one with failures
+            _pytest_report: Optional[PytestReport] = next(
+                (pr for pr in structured_results if pr and pr.failures),
+                None,
+            )
 
             if not last_failures:
                 return HealingReport(
@@ -387,7 +481,10 @@ class Healer:
                 if cached_patch:
                     _applied = []
                     for fp, content in cached_patch.items():
-                        full = Path(self.workspace) / fp
+                        full = resolve_workspace_path(self.workspace, fp)
+                        if full is None:
+                            logger.warning("[Healer] PatchCache: skipping path outside workspace: %s", fp)
+                            continue
                         if full.exists():
                             full.write_text(content, encoding="utf-8")
                             _applied.append(fp)
@@ -459,14 +556,28 @@ class Healer:
                     attempts.append(det)
                     continue
 
-                # LLM fixes: collect broken files (respecting test-edit flag)
-                broken = self._extract_all_broken_files(
-                    failure, allow_test_files=_effective_allow_test_edits
-                )
-                for fp in broken:
-                    if fp not in file_errors:
-                        file_errors[fp] = []
-                    file_errors[fp].append(failure)
+                # LLM fixes: collect broken files.
+                # Prefer structured pytest data (exact source files from traceback)
+                # over regex-scanning raw text — more accurate attribution.
+                if _pytest_report and _pytest_report.broken_source_files:
+                    for fp in list(_pytest_report.broken_source_files.keys())[:_MAX_BROKEN_FILES_PER_ROUND]:
+                        if self._is_fixable_file(fp, allow_test_files=_effective_allow_test_edits):
+                            if fp not in file_errors:
+                                file_errors[fp] = []
+                            file_errors[fp].append(failure)
+                    # Fall back to test files if no source files identified
+                    if not file_errors:
+                        broken = self._extract_all_broken_files(
+                            failure, allow_test_files=_effective_allow_test_edits
+                        )
+                        for fp in broken:
+                            file_errors.setdefault(fp, []).append(failure)
+                else:
+                    broken = self._extract_all_broken_files(
+                        failure, allow_test_files=_effective_allow_test_edits
+                    )
+                    for fp in broken:
+                        file_errors.setdefault(fp, []).append(failure)
 
             if blocked and not file_errors:
                 return HealingReport(
@@ -496,7 +607,8 @@ class Healer:
 
             # ── Fix broken files (capped fan-out, bounded concurrency) ────────
             batch_attempts = await self._fix_files_parallel(
-                file_errors, attempt_num, _effective_allow_test_edits
+                file_errors, attempt_num, _effective_allow_test_edits,
+                pytest_report=_pytest_report,
             )
             attempts.extend(batch_attempts)
 
@@ -517,12 +629,26 @@ class Healer:
                     if full.exists():
                         patch_to_store[fp] = full.read_text(encoding="utf-8")
                 if patch_to_store:
-                    # Store under the pre-fix cache key so future identical failures
-                    # can reuse the patch before another LLM call.
                     _store_key = _cache_key or _patch_cache_key(
                         _fhash, list(file_errors.keys()), self.workspace, self._model_id
                     )
                     self._patch_cache.put(_store_key, patch_to_store)
+
+            # ── PatternStore: record successful cross-project patterns ─────────
+            if batch_attempts:
+                for failure in last_failures:
+                    failure_type_str = classify_failure(
+                        failure.command, failure.stdout, failure.stderr
+                    ).value
+                    fp_key = self._pattern_store.fingerprint(
+                        failure_type_str, f"{failure.stdout}\n{failure.stderr}"
+                    )
+                    changed = [fp for a in batch_attempts for fp in a.changed_files]
+                    fix_desc = f"Modified {changed[:3]} to fix {failure_type_str}"
+                    try:
+                        self._pattern_store.record(fp_key, fix_desc)
+                    except Exception:
+                        pass  # pattern persistence is best-effort
 
         return HealingReport(
             success=False,
@@ -561,6 +687,10 @@ class Healer:
             fixed_content = await self.llm_client.generate(prompt, system_prompt=HEALER_SYSTEM_PROMPT)
             fixed_content = self._normalize_content(fixed_content)
 
+            if not _healer_output_ok(fixed_content, content):
+                logger.warning("[Healer] Static fix rejected for %s — truncated/too short", target_file)
+                return None
+
             full_path.write_text(fixed_content, encoding="utf-8")
             return HealAttempt(
                 attempt_number=attempt_number,
@@ -569,7 +699,34 @@ class Healer:
                 changed_files=[target_file],
             )
 
-        tasks = [_fix_static_issue(fp, issues) for fp, issues in issues_by_file.items()]
+        import os as _os
+        _per_file_timeout = int(_os.environ.get("CODEGEN_LLM_TIMEOUT", "120")) + 30
+
+        async def _fix_with_timeout(fp: str, issues: list) -> Optional[HealAttempt]:
+            try:
+                result = await asyncio.wait_for(
+                    _fix_static_issue(fp, issues),
+                    timeout=_per_file_timeout,
+                )
+                status = "fixed" if result else "no change"
+                print(f"  [LiveGuard] {fp}: {status}")
+                return result
+            except asyncio.TimeoutError:
+                logger.warning("[LiveGuard] Micro-heal timed out after %ds: %s", _per_file_timeout, fp)
+                print(f"  [LiveGuard] {fp}: timed out ({_per_file_timeout}s) — skipped")
+                return None
+            except Exception as exc:
+                logger.warning("[LiveGuard] Micro-heal error for %s: %s", fp, exc)
+                return None
+
+        # Cap concurrency to 3 so slow CLI providers don't all block at once
+        _sem = asyncio.Semaphore(3)
+
+        async def _guarded(fp: str, issues: list) -> Optional[HealAttempt]:
+            async with _sem:
+                return await _fix_with_timeout(fp, issues)
+
+        tasks = [_guarded(fp, issues) for fp, issues in issues_by_file.items()]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         return [r for r in results if isinstance(r, HealAttempt)]
 
@@ -580,6 +737,7 @@ class Healer:
         file_errors: dict[str, list],
         attempt_num: int,
         allow_test_files: bool = False,
+        pytest_report: Optional[PytestReport] = None,
     ) -> List[HealAttempt]:
         """Fix broken files. Uses combined multi-file fix when >1 file is broken
         (single LLM call sees all broken files together — better for cross-file errors).
@@ -594,7 +752,9 @@ class Healer:
             return []
 
         if len(fixable) > 1:
-            combined = await self._fix_files_combined(fixable, attempt_num)
+            combined = await self._fix_files_combined(
+                fixable, attempt_num, pytest_report=pytest_report
+            )
             if combined:
                 return combined
 
@@ -604,7 +764,9 @@ class Healer:
         async def _guarded(fp: str, errs: list) -> Optional[HealAttempt]:
             async with sem:
                 return await self._fix_file_for_errors(
-                    fp, errs, attempt_num, allow_test_files=allow_test_files
+                    fp, errs, attempt_num,
+                    allow_test_files=allow_test_files,
+                    pytest_report=pytest_report,
                 )
 
         tasks = [_guarded(fp, errs) for fp, errs in fixable.items()]
@@ -615,6 +777,7 @@ class Healer:
         self,
         file_errors: dict[str, list],
         attempt_num: int,
+        pytest_report: Optional[PytestReport] = None,
     ) -> List[HealAttempt]:
         """Fix multiple broken files in a single LLM call.
 
@@ -651,10 +814,24 @@ class Healer:
         first_fp = next(iter(file_errors))
         related_files = self._build_related_files_context(first_fp, max_files=8)
 
+        # Structured pytest context (exact test names, assertions, source traces)
+        structured_ctx = ""
+        if pytest_report:
+            structured_ctx = format_structured_failures_for_prompt(pytest_report)
+
+        # Pattern store hints
+        fingerprints = [
+            self._pattern_store.fingerprint(failure_type.value, f"{f.stdout}\n{f.stderr}")
+            for f in all_failures[:3]
+        ]
+        pattern_hints = self._pattern_store.known_patterns_prompt(fingerprints)
+
+        error_block = (structured_ctx or combined_errors) + pattern_hints
+
         prompt = HEALER_MULTI_FILE_PROMPT_TEMPLATE.format(
             command=all_failures[0].command,
             failure_type=failure_type.value,
-            error_output=combined_errors,
+            error_output=error_block,
             files_to_fix=files_section,
             related_files=related_files,
         )
@@ -671,10 +848,20 @@ class Healer:
         for fp, fixed_content in data.items():
             if not isinstance(fixed_content, str) or not fixed_content.strip():
                 continue
-            full_path = Path(self.workspace) / fp
+            full_path = resolve_workspace_path(self.workspace, fp)
+            if full_path is None:
+                logger.warning("[Healer] Multi-fix: skipping path outside workspace: %s", fp)
+                continue
             if not full_path.exists():
                 continue
+            original_content = full_path.read_text(encoding="utf-8", errors="replace")
             fixed_content = self._normalize_content(fixed_content)
+            if not _healer_output_ok(fixed_content, original_content):
+                logger.warning(
+                    "[Healer] Multi-fix: rejecting fix for %s — truncated or too short (%d→%d lines)",
+                    fp, original_content.count('\n'), fixed_content.count('\n') if fixed_content else 0,
+                )
+                continue
             full_path.write_text(fixed_content, encoding="utf-8")
             print(f"  [Healer] Multi-fix: wrote {fp} (attempt {attempt_num})")
             attempts.append(HealAttempt(
@@ -732,7 +919,8 @@ class Healer:
             return False
         if not allow_test_files and not self.allow_test_file_edits and _is_test_file(fp):
             return False
-        return os.path.exists(os.path.join(self.workspace, fp))
+        candidate = resolve_workspace_path(self.workspace, fp)
+        return candidate is not None and candidate.exists()
 
     def _build_related_files_context(self, target_file_path: str, max_files: int = 6) -> str:
         """Build a compact summary of what other project files export.
@@ -784,6 +972,7 @@ class Healer:
         failures: list,
         attempt_num: int,
         allow_test_files: bool = False,
+        pytest_report: Optional[PytestReport] = None,
     ) -> Optional[HealAttempt]:
         """LLM-fix a single source file using all error outputs that reference it."""
         full_path, path_err = self._resolve_target_path(file_path)
@@ -810,10 +999,31 @@ class Healer:
 
         related_files = self._build_related_files_context(file_path)
 
+        # Prefer structured pytest context when available for this specific file
+        structured_ctx = ""
+        if pytest_report:
+            relevant = [
+                tf for tf in pytest_report.failures
+                if file_path in tf.source_files or file_path == tf.test_file
+            ]
+            if relevant:
+                from .pytest_parser import PytestReport as _PR, format_structured_failures_for_prompt
+                _mini = _PR(failures=relevant, failed=len(relevant))
+                structured_ctx = format_structured_failures_for_prompt(_mini)
+
+        # Pattern store hints
+        fingerprints = [
+            self._pattern_store.fingerprint(failure_type.value, f"{f.stdout}\n{f.stderr}")
+            for f in failures[:2]
+        ]
+        pattern_hints = self._pattern_store.known_patterns_prompt(fingerprints)
+
+        error_block = (structured_ctx or combined_errors) + pattern_hints
+
         prompt = HEALER_USER_PROMPT_TEMPLATE.format(
             command=failures[0].command,
             failure_type=failure_type.value,
-            error_output=combined_errors,
+            error_output=error_block,
             file_path=file_path,
             file_content=f"Current content:\n{_cap_file_content(content)}",
             related_files=related_files,
@@ -822,6 +1032,14 @@ class Healer:
 
         fixed = await self.llm_client.generate(prompt, system_prompt=HEALER_SYSTEM_PROMPT)
         fixed = self._normalize_content(fixed)
+
+        if not _healer_output_ok(fixed, content):
+            logger.warning(
+                "[Healer] Rejecting fix for %s — output is truncated or >40%% shorter than original "
+                "(%d lines → %d lines). File unchanged.",
+                file_path, content.count('\n'), fixed.count('\n') if fixed else 0,
+            )
+            return None
 
         full_path.write_text(fixed, encoding="utf-8")
         print(f"  [Healer] Fixed {file_path} (attempt {attempt_num})")

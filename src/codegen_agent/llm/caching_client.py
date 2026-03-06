@@ -17,11 +17,18 @@ class CachingLLMClient:
         cache: LLMCache,
         provider: str,
         model: Optional[str],
+        char_counter=None,
     ):
         self._client = client
         self._cache = cache
         self._provider = provider
         self._model = model
+        self._counter = char_counter
+
+    def _track(self, prompt: str, response: str) -> None:
+        if self._counter is not None:
+            self._counter.total_prompt_chars += len(prompt)
+            self._counter.total_response_chars += len(response)
 
     def _cache_key(self, prompt: str, system_prompt: str) -> str:
         return f"{system_prompt}\n---\n{prompt}" if system_prompt else prompt
@@ -33,6 +40,7 @@ class CachingLLMClient:
             return cached
         response = await self._client.generate(prompt, system_prompt=system_prompt)
         self._cache.set(key, self._provider, self._model, response)
+        self._track(prompt, response)
         return response
 
     async def astream(self, prompt: str, system_prompt: str = "") -> AsyncIterator[str]:

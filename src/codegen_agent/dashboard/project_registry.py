@@ -151,6 +151,13 @@ class Project:
     def stats(self) -> dict:
         return self._data.get("stats", {})
 
+    async def update_stats(self, **kwargs) -> None:
+        """Merge keyword-argument key/value pairs into the stats dict and persist."""
+        async with self._lock:
+            s = self._data.setdefault("stats", {})
+            s.update(kwargs)
+            self._save()
+
     # ── Activity log ──────────────────────────────────────────────────────────
 
     async def log_activity(self, msg: str) -> None:
@@ -182,6 +189,14 @@ class Project:
             self._save()
 
     # ── Accessors ─────────────────────────────────────────────────────────────
+
+    @property
+    def name(self) -> str:
+        return self.brief.get("name") or self.id
+
+    @property
+    def updated_at(self) -> float:
+        return self._data.get("updated_at", 0.0)
 
     @property
     def parallel(self) -> bool:

@@ -11,6 +11,10 @@ const S = {
   qaFiles:         {},   // pid → [{file, issues, clean, lines}, ...]
   qaFinal:         {},   // pid → {score, approved, issues, suggestions}
   healStatus:      {},   // pid → 'running' | 'done' | 'failed'
+  healPass:        {},   // pid → {current, total}
+  healFiles:       {},   // pid → [{file, status, pass}]  status: 'fixing'|'fixed'|'quick'|'regen'|'cache'|'skipped'
+  e2eStatus:       {},   // pid → 'running' | 'done' | 'failed' | 'skipped'
+  e2eResult:       {},   // pid → e2e result data
   form: {
     tab:      'text',    // 'text' | 'upload'
     file:     null,
@@ -64,7 +68,10 @@ function onEvent(ev) {
   if (pid && ev.type === 'build_approved') {
     S.qaFiles[pid] = [];
     S.healStatus[pid] = 'running';
+    S.healPass[pid] = null;
+    S.healFiles[pid] = [];
     S.qaFinal[pid] = null;
+    S.e2eStatus[pid] = 'running';
     if (S.selectedProject === pid) _updatePostBuildPanel(pid);
   } else if (pid && ev.type === 'heal_started') {
     S.healStatus[pid] = 'running';
@@ -72,13 +79,45 @@ function onEvent(ev) {
   } else if (pid && ev.type === 'heal_complete') {
     S.healStatus[pid] = (ev.data?.success === false) ? 'failed' : 'done';
     if (S.selectedProject === pid) _patchHealBadge(pid);
+  } else if (pid && ev.type === 'fix_pass') {
+    S.healPass[pid] = { current: ev.data?.pass || 0, total: ev.data?.total || 0 };
+    if (S.selectedProject === pid) _patchHealPanel(pid);
+  } else if (pid && ev.type === 'bug_found') {
+    if (!S.healFiles[pid]) S.healFiles[pid] = [];
+    const existing = S.healFiles[pid].find(f => f.file === ev.data?.file);
+    if (!existing) {
+      S.healFiles[pid].push({ file: ev.data?.file, status: 'fixing', pass: S.healPass[pid]?.current || 1 });
+      if (S.selectedProject === pid) _appendHealFileRow(pid, S.healFiles[pid][S.healFiles[pid].length - 1]);
+    }
+  } else if (pid && ev.type === 'bug_fixed') {
+    if (!S.healFiles[pid]) S.healFiles[pid] = [];
+    const d = ev.data || {};
+    const status = d.regenerated ? 'regen' : d.quick ? 'quick' : d.cache_hit ? 'cache' : 'fixed';
+    const existing = S.healFiles[pid].find(f => f.file === d.file);
+    if (existing) {
+      existing.status = status;
+      if (S.selectedProject === pid) _updateHealFileRow(pid, existing);
+    } else {
+      const entry = { file: d.file, status, pass: S.healPass[pid]?.current || 1 };
+      S.healFiles[pid].push(entry);
+      if (S.selectedProject === pid) _appendHealFileRow(pid, entry);
+    }
+    if (S.selectedProject === pid) _patchHealBadge(pid);
   } else if (pid && ev.type === 'qa_file_reviewed') {
     if (!S.qaFiles[pid]) S.qaFiles[pid] = [];
     S.qaFiles[pid].push(ev.data);
     if (S.selectedProject === pid) _appendQAFileRow(pid, ev.data);
   } else if (pid && ev.type === 'qa_result') {
+    const prev = S.qaFinal[pid];
+    ev.data._prevScore = prev?.score ?? null;  // track score trend
     S.qaFinal[pid] = ev.data;
     if (S.selectedProject === pid) _patchQAFinal(pid, ev.data);
+  } else if (pid && (ev.type === 'e2e_result' || ev.type === 'e2e_building' || ev.type === 'e2e_started')) {
+    if (ev.type === 'e2e_result') {
+      S.e2eStatus[pid] = ev.data?.skipped ? 'skipped' : ev.data?.success ? 'done' : 'failed';
+      S.e2eResult[pid] = ev.data;
+    }
+    if (S.selectedProject === pid) _patchE2EBadge(pid);
   } else {
     if (pid) refreshProject(pid);
   }
@@ -322,21 +361,52 @@ function _renderPostBuildPanel(pid, state) {
   const approved = qaFinal?.approved ?? false;
   const scoreCls = score === null ? '' : (score >= 80 ? 'good' : score >= 60 ? 'ok' : 'bad');
 
+  const healPass     = S.healPass[pid];
+  const healFiles    = S.healFiles[pid] || [];
+  const fixedCount   = healFiles.filter(f => f.status !== 'fixing').length;
   const healBadgeCls = healSt === 'done' ? 'done' : healSt === 'failed' ? 'failed' : 'running';
-  const healIcon     = healSt === 'done' ? '✓ Heal done' : healSt === 'failed' ? '✗ Heal failed' : '<span class="spinner"></span> Healing';
+  const healPassStr  = healPass?.total > 0 ? ` Pass ${healPass.current}/${healPass.total}` : '';
+  const healCountStr = healFiles.length > 0 ? ` · ${fixedCount}/${healFiles.length} fixed` : '';
+  const healIcon     = healSt === 'done'
+    ? `✓ Heal done (${fixedCount} fixed)`
+    : healSt === 'failed' ? '✗ Heal failed'
+    : `<span class="spinner"></span> Healing${healPassStr}${healCountStr}`;
   const qaBadgeCls   = qaFinal ? 'done' : 'running';
   const qaIcon       = qaFinal ? `✓ QA done (${score?.toFixed(0)}/100)` : '<span class="spinner"></span> QA scanning';
+  const e2eSt        = S.e2eStatus[pid] || 'running';
+  const e2eRes       = S.e2eResult[pid];
+  const e2eBadgeCls  = e2eSt === 'done' ? 'done' : e2eSt === 'failed' ? 'failed' : e2eSt === 'skipped' ? '' : 'running';
+  const e2eIcon      = e2eSt === 'done'
+    ? `✓ E2E (${e2eRes?.endpoints_hit?.length||0} ok)`
+    : e2eSt === 'failed' ? '✗ E2E failed'
+    : e2eSt === 'skipped' ? '— E2E skipped'
+    : '<span class="spinner"></span> E2E testing';
 
   return `
     <div class="build-approved-banner" id="postBuildBanner-${pid}">
       <div class="build-approved-icon">✅</div>
       <div>
         <div class="build-approved-title">Build Approved</div>
-        <div class="build-approved-sub">Docs, Heal, and QA are running in parallel</div>
+        <div class="build-approved-sub">Docs, Heal, QA and E2E running in parallel</div>
       </div>
       <div class="parallel-status">
         <div class="parallel-badge ${healBadgeCls}" id="healBadge-${pid}">${healIcon}</div>
         <div class="parallel-badge ${qaBadgeCls}"   id="qaBadge-${pid}">${qaIcon}</div>
+        <div class="parallel-badge ${e2eBadgeCls}"  id="e2eBadge-${pid}">${e2eIcon}</div>
+      </div>
+    </div>
+
+    <div class="qa-panel" id="healPanel-${pid}" style="margin-bottom:12px">
+      <div class="qa-panel-header">
+        <div class="qa-panel-title">
+          <span>🔧 Live Healer</span>
+          <span class="text-sm text-muted" id="healPanelMeta-${pid}">${healFiles.length ? `${fixedCount}/${healFiles.length} files fixed` : (healSt === 'running' ? 'Waiting for pytest...' : 'No issues found')}</span>
+          ${healPass?.total > 0 ? `<span class="text-sm purple" style="margin-left:6px">Pass ${healPass.current}/${healPass.total}</span>` : ''}
+        </div>
+        ${healSt === 'done' ? `<span class="text-sm green">✓ Complete</span>` : healSt === 'failed' ? `<span class="text-sm red">✗ Failed</span>` : `<span class="text-sm yellow"><span class="spinner"></span> Running</span>`}
+      </div>
+      <div class="qa-files-list" id="healFilesList-${pid}">
+        ${healFiles.map(f => _healFileRowHTML(f)).join('')}
       </div>
     </div>
 
@@ -398,12 +468,86 @@ function _appendQAFileRow(pid, fileData) {
   }
 }
 
+function _healFileRowHTML(f) {
+  const icons = { fixing: '⟳', fixed: '✓', quick: '⚡', regen: '♻', cache: '◎', skipped: '—' };
+  const colors = { fixing: 'yellow', fixed: 'green', quick: 'cyan', regen: 'purple', cache: 'cyan', skipped: 'text-muted' };
+  const labels = { fixing: 'fixing', fixed: 'fixed', quick: 'quick fix', regen: 'regenerated', cache: 'from cache', skipped: 'skipped' };
+  const st = f.status || 'fixing';
+  return `<div class="qa-file-row" id="healRow-${CSS.escape(f.file)}">
+    <div class="qa-file-icon ${colors[st]}">${icons[st]}</div>
+    <div class="qa-file-info">
+      <div class="qa-file-path">${esc(f.file)}</div>
+    </div>
+    <div class="qa-file-lines ${colors[st]}" style="font-size:11px">${labels[st]}</div>
+  </div>`;
+}
+
 function _patchHealBadge(pid) {
   const el = document.getElementById(`healBadge-${pid}`);
   if (!el) return;
-  const st = S.healStatus[pid] || 'running';
+  const st        = S.healStatus[pid] || 'running';
+  const healPass  = S.healPass[pid];
+  const healFiles = S.healFiles[pid] || [];
+  const fixedCount = healFiles.filter(f => f.status !== 'fixing').length;
   el.className = `parallel-badge ${st === 'done' ? 'done' : st === 'failed' ? 'failed' : 'running'}`;
-  el.innerHTML = st === 'done' ? '✓ Heal done' : st === 'failed' ? '✗ Heal failed' : '<span class="spinner"></span> Healing';
+  if (st === 'done')   el.innerHTML = `✓ Heal done (${fixedCount} fixed)`;
+  else if (st === 'failed') el.innerHTML = `✗ Heal failed`;
+  else {
+    const passStr  = healPass?.total > 0 ? ` Pass ${healPass.current}/${healPass.total}` : '';
+    const countStr = healFiles.length > 0 ? ` · ${fixedCount}/${healFiles.length}` : '';
+    el.innerHTML = `<span class="spinner"></span> Healing${passStr}${countStr}`;
+  }
+}
+
+function _patchHealPanel(pid) {
+  const healPass  = S.healPass[pid];
+  const healFiles = S.healFiles[pid] || [];
+  const fixedCount = healFiles.filter(f => f.status !== 'fixing').length;
+  // Update pass label
+  const meta = document.getElementById(`healPanelMeta-${pid}`);
+  if (meta) meta.textContent = healFiles.length ? `${fixedCount}/${healFiles.length} files fixed` : 'Waiting for pytest...';
+  // Update pass badge in header
+  const panel = document.getElementById(`healPanel-${pid}`);
+  if (panel && healPass?.total > 0) {
+    let passEl = panel.querySelector('.heal-pass-badge');
+    if (!passEl) {
+      passEl = document.createElement('span');
+      passEl.className = 'text-sm purple heal-pass-badge';
+      passEl.style.marginLeft = '6px';
+      document.getElementById(`healPanelMeta-${pid}`)?.after(passEl);
+    }
+    passEl.textContent = `Pass ${healPass.current}/${healPass.total}`;
+  }
+  _patchHealBadge(pid);
+}
+
+function _appendHealFileRow(pid, f) {
+  const list = document.getElementById(`healFilesList-${pid}`);
+  if (!list) return;
+  const div = document.createElement('div');
+  div.innerHTML = _healFileRowHTML(f);
+  list.appendChild(div.firstElementChild);
+  list.scrollTop = list.scrollHeight;
+  _patchHealPanel(pid);
+}
+
+function _updateHealFileRow(pid, f) {
+  const row = document.getElementById(`healRow-${CSS.escape(f.file)}`);
+  if (!row) return;
+  row.outerHTML = _healFileRowHTML(f);
+  _patchHealPanel(pid);
+}
+
+function _patchE2EBadge(pid) {
+  const el = document.getElementById(`e2eBadge-${pid}`);
+  if (!el) return;
+  const st  = S.e2eStatus[pid] || 'running';
+  const res = S.e2eResult[pid];
+  el.className = `parallel-badge ${st === 'done' ? 'done' : st === 'failed' ? 'failed' : st === 'skipped' ? '' : 'running'}`;
+  if (st === 'done')    el.innerHTML = `✓ E2E (${res?.endpoints_hit?.length || 0} ok)`;
+  else if (st === 'failed')  el.innerHTML = `✗ E2E failed`;
+  else if (st === 'skipped') el.innerHTML = `— E2E skipped`;
+  else                       el.innerHTML = `<span class="spinner"></span> E2E testing`;
 }
 
 function _patchQAFinal(pid, qa) {
@@ -412,17 +556,24 @@ function _patchQAFinal(pid, qa) {
     badge.className = 'parallel-badge done';
     badge.innerHTML = `✓ QA done (${qa.score?.toFixed(0)}/100)`;
   }
-  // Re-render qa panel header score
+  // Re-render qa panel header score with trend indicator
   const panel = document.getElementById(`qaPanel-${pid}`);
   if (!panel) return;
   const score    = qa.score ?? 0;
   const approved = qa.approved ?? false;
   const scoreCls = score >= 80 ? 'good' : score >= 60 ? 'ok' : 'bad';
+  const prev = qa._prevScore;
+  const trend = prev !== null && prev !== undefined
+    ? (score > prev ? `<span class="green" style="font-size:13px;margin-left:6px">▲${(score-prev).toFixed(0)}</span>`
+       : score < prev ? `<span class="red" style="font-size:13px;margin-left:6px">▼${(prev-score).toFixed(0)}</span>`
+       : '')
+    : '';
   const headerRight = panel.querySelector('.qa-panel-header > :last-child');
   if (headerRight) {
-    headerRight.outerHTML = `<div class="qa-score-big ${scoreCls}">${score.toFixed(0)}<span style="font-size:14px;color:var(--text-muted)">/100</span>${approved?'<span class="text-sm green" style="margin-left:8px">✓ approved</span>':''}</div>`;
+    headerRight.outerHTML = `<div class="qa-score-big ${scoreCls}">${score.toFixed(0)}<span style="font-size:14px;color:var(--text-muted)">/100</span>${trend}${approved?'<span class="text-sm green" style="margin-left:8px">✓ approved</span>':''}</div>`;
   }
-  // Append issues + suggestions
+  // Replace issues + suggestions (remove old ones first to avoid duplicates on re-audit)
+  panel.querySelectorAll('.qa-issues-list, .qa-suggestions-list').forEach(el => el.remove());
   if (qa.issues?.length) {
     const issuesDiv = document.createElement('div');
     issuesDiv.className = 'qa-issues-list';
@@ -433,6 +584,7 @@ function _patchQAFinal(pid, qa) {
   }
   if (qa.suggestions?.length) {
     const sugDiv = document.createElement('div');
+    sugDiv.className = 'qa-suggestions-list';
     sugDiv.style.marginTop = '10px';
     sugDiv.innerHTML = `<div class="section-label" style="margin-bottom:8px">Suggestions</div>`
       + qa.suggestions.map(s=>`<div class="qa-issue-item" style="color:var(--cyan)"><span>→</span><span>${esc(s)}</span></div>`).join('');
@@ -474,18 +626,29 @@ function fmtEvMsg(ev) {
     case 'task_start':        return `<span class="blue">⚙ ${esc(d.title||d.task_id)}</span>`;
     case 'task_done':         return `<span class="green">✓ ${esc(d.task_id)} (${(d.files||[]).length}f)</span>`;
     case 'bug_found':         return `<span class="yellow">⚠ bug in ${esc(d.file)}</span>`;
-    case 'bug_fixed':         return `<span class="green">✔ fixed ${esc(d.file)}${d.escalated?' (complex tier)':''}</span>`;
+    case 'bug_fixed':         return d.regenerated ? `<span class="purple">♻ Re-architected: ${esc(d.file)}</span>` : d.quick ? `<span class="cyan">⚡ Quick-fixed: ${esc(d.file)}</span>` : d.qa_driven ? `<span class="cyan">🔍 QA fix: ${esc(d.file)}</span>` : d.escalated ? `<span class="green">✔ fixed ${esc(d.file)} (complex tier)</span>` : `<span class="green">✓ Fixed: ${esc(d.file)}</span>`;
     case 'git_commit':        return `<span class="yellow">⬡ ${esc(d.sha)} ${esc((d.message||'').slice(0,50))}</span>`;
     case 'build_approved':    return `<span class="green">✅ BUILD APPROVED — ${d.files||0} files — Heal + QA launching</span>`;
-    case 'heal_started':      return `<span class="yellow"><span class="spinner"></span> Healer started</span>`;
+    case 'fix_pass':          return d.pass === 0 ? `<span class="yellow">🔧 Healer: pre-pass (install deps, init files)</span>` : `<span class="yellow">🔧 Healer: pass ${d.pass}/${d.total}</span>`;
+    case 'heal_started':      return d.rearchitect ? `<span class="purple"><span class="spinner"></span> Re-architecting ${d.files?.length||0} file(s)</span>` : d.qa_driven ? `<span class="yellow"><span class="spinner"></span> QA-driven fix pass</span>` : `<span class="yellow"><span class="spinner"></span> Healer started</span>`;
     case 'heal_complete':     return d.success===false ? `<span class="red">✗ Heal failed: ${esc((d.error||'').slice(0,60))}</span>` : `<span class="green">✓ Heal complete</span>`;
     case 'qa_file_reviewed':  return `<span class="${d.clean?'green':'yellow'}">${d.clean?'✓':'⚠'} QA: ${esc(d.file)} (${d.lines||0}L)${d.issues?.length?` — ${d.issues.length} issue(s)`:''}</span>`;
-    case 'qa_result':         return `<span class="${d.approved||d.score>=75?'green':'yellow'}">🔍 QA final: ${d.score?.toFixed(0)||0}/100 ${d.approved?'✓ approved':'⚠ not approved'}</span>`;
+    case 'qa_result':         return `<span class="${d.approved||d.score>=75?'green':'yellow'}">🔍 QA: ${d.score?.toFixed(0)||0}/100 ${d.approved?'✓ approved':'⚠ not approved'}</span>`;
     case 'build_complete':    return `<span class="green">🏁 Done — qa=${d.qa_score?.toFixed(0)||0}/100 ${d.api_calls||0} calls $${(d.cost_usd||0).toFixed(4)}</span>`;
+    case 'e2e_building':      return `<span class="yellow"><span class="spinner"></span> E2E: building container</span>`;
+    case 'e2e_started':       return `<span class="yellow"><span class="spinner"></span> E2E: container up on :${d.host_port} — probing</span>`;
+    case 'e2e_result':        return d.skipped ? `<span class="text-muted">— E2E skipped (no Docker)</span>` : d.success ? `<span class="green">✓ E2E passed — ${d.endpoints_hit?.length||0} endpoint(s) ok (${d.startup_seconds?.toFixed(1)||'?'}s startup)</span>` : `<span class="red">✗ E2E failed: ${esc((d.error||'no endpoints responded').slice(0,60))}</span>`;
     case 'docs_done':         return `<span class="cyan">📄 Docs done</span>`;
     case 'project_failed':    return `<span class="red">✗ failed: ${esc((d.error||'').slice(0,60))}</span>`;
     case 'inbox_file':        return `<span class="purple">📂 ${esc(d.file)} ${d.source==='ui'?'(via UI)':''}</span>`;
-    case 'terminal_line':     return `<span class="text-muted monospace">${esc(d.line||'')}</span>`;
+    case 'terminal_line': {
+      const line = d.line || '';
+      if (line.startsWith('[Phase 1/2]'))
+        return `<span class="cyan" style="font-weight:700">⬡ ${esc(line)}</span>`;
+      if (line.startsWith('[Phase 2/2]'))
+        return `<span class="purple" style="font-weight:700">🎨 ${esc(line)}</span>`;
+      return `<span class="text-muted monospace">${esc(line)}</span>`;
+    }
     default:                  return `<span class="text-muted">${esc(ev.type)}</span>`;
   }
 }

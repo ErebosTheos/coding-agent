@@ -194,3 +194,66 @@ def test_calculate_waves_cycle_strict_mode_raises(tmp_path):
             del os.environ["CODEGEN_STRICT_DEP_GRAPH"]
         else:
             os.environ["CODEGEN_STRICT_DEP_GRAPH"] = old
+
+
+# ── Regression: _execute_waves signature ─────────────────────────────────────
+
+def test_execute_waves_non_bulk_path_does_not_crash(tmp_path):
+    """_execute_waves(architecture) must work with the canonical single-arg signature.
+
+    Previously a duplicate definition (taking waves+architecture) shadowed the
+    correct one, causing TypeError when the non-bulk path was used.
+    """
+    generated = []
+
+    async def fake_execute_node(node, arch):
+        from codegen_agent.models import GeneratedFile
+        import hashlib
+        content = "# ok"
+        p = tmp_path / node.file_path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content)
+        return GeneratedFile(
+            node_id=node.node_id, file_path=node.file_path, content=content,
+            sha256=hashlib.sha256(content.encode()).hexdigest(),
+        )
+
+    llm = DummyLLM("{}")
+    executor = Executor(llm_client=llm, workspace=str(tmp_path), max_bulk_files=0)
+    executor._execute_node = fake_execute_node  # type: ignore[method-assign]
+
+    architecture = Architecture(
+        file_tree=["src/a.py", "src/b.py"],
+        nodes=[
+            ExecutionNode(node_id="a", file_path="src/a.py", purpose="a"),
+            ExecutionNode(node_id="b", file_path="src/b.py", purpose="b"),
+        ],
+        global_validation_commands=[],
+    )
+
+    result = asyncio.run(executor._execute_waves(architecture))
+    assert len(result.generated_files) == 2
+    assert result.failed_nodes == []
+
+
+def test_execute_waves_from_list_used_by_fallback(tmp_path):
+    """_execute_wave_fallback must call _execute_waves_from_list, not _execute_waves."""
+    called = {"method": None}
+
+    async def fake_from_list(waves, arch):
+        called["method"] = "_execute_waves_from_list"
+        from codegen_agent.models import ExecutionResult
+        return ExecutionResult(generated_files=[], failed_nodes=[])
+
+    llm = DummyLLM("{}")
+    executor = Executor(llm_client=llm, workspace=str(tmp_path), max_bulk_files=0)
+    executor._execute_waves_from_list = fake_from_list  # type: ignore[method-assign]
+
+    architecture = Architecture(
+        file_tree=["src/a.py"],
+        nodes=[ExecutionNode(node_id="a", file_path="src/a.py", purpose="a")],
+        global_validation_commands=[],
+    )
+
+    asyncio.run(executor._execute_wave_fallback(architecture))
+    assert called["method"] == "_execute_waves_from_list"

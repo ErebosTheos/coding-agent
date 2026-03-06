@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "codegen_agent"
 version = "0.1.0"
 description = "Autonomous Codegen Agent"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 dependencies = [
     "pyyaml",
     "fastapi>=0.110.0",
@@ -23,3 +23,4 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 norecursedirs = ["Legacy Reference", "benchmark_output", "test_output", ".venv", ".git"]
+asyncio_mode = "auto"

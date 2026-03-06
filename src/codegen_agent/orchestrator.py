@@ -23,6 +23,7 @@ from .checkpoint import CheckpointManager
 from .reporter import Reporter
 from .workspace_lock import WorkspaceLock
 from .live_guard import post_execution_guard
+from .context_builder import ProjectContextBuilder
 from .startup_guard import detect_entry_point, build_import_check_command
 
 
@@ -440,6 +441,7 @@ class Orchestrator:
         self.router = LLMRouter(config_path)
         self.checkpoint_manager = CheckpointManager(workspace)
         self.reporter = Reporter(workspace)
+        self.skip_qa: bool = False  # set by dashboard to skip internal QA
 
     async def run(self, prompt: str, resume: bool = False, max_heals: int = 3) -> PipelineReport:
         """Runs the full pipeline with aggressive parallelism."""
@@ -476,8 +478,12 @@ class Orchestrator:
                 _t0 = time.monotonic()
                 _tw0 = time.time()
                 print("Stage 3: Executing (resuming from checkpoint)...")
-                executor = Executor(self.router.get_client_for_role("executor"), self.workspace)
-                report = replace(report, execution_result=await executor.execute(report.architecture))
+                _pcb_resume = ProjectContextBuilder(self.workspace)
+                _pcb_resume.build_from_architecture(report.architecture)
+                executor = Executor(self.router.get_client_for_role("executor"), self.workspace, tier_clients=self.router.get_tier_clients("executor"))
+                _exec_result = await executor.execute(report.architecture)
+                _pcb_resume.build_from_generated_files(_exec_result.generated_files)
+                report = replace(report, execution_result=_exec_result)
                 await _save(report)
                 _t1 = time.monotonic()
                 prov, mdl = _role_provider(self.router, "executor")
@@ -494,10 +500,14 @@ class Orchestrator:
                 print("Stage 1+2+3: Planning, Architecting & Executing (streaming)...")
                 stream_exec = StreamingPlanArchExecutor(
                     self.router.get_client_for_role("planner"),
-                    Executor(self.router.get_client_for_role("executor"), self.workspace),
+                    Executor(self.router.get_client_for_role("executor"), self.workspace,
+                             tier_clients=self.router.get_tier_clients("executor")),
                 )
                 try:
                     plan, architecture, execution_result = await stream_exec.run(prompt)
+                    _pcb = ProjectContextBuilder(self.workspace)
+                    _pcb.build_from_architecture(architecture)
+                    _pcb.build_from_generated_files(execution_result.generated_files)
                     report = replace(report, plan=plan, architecture=architecture,
                                      execution_result=execution_result)
                 except Exception as e:
@@ -516,8 +526,13 @@ class Orchestrator:
                                 architect = Architect(self.router.get_client_for_role("architect"))
                                 report = replace(report, architecture=await architect.architect(report.plan))
                     if not report.execution_result:
-                        executor = Executor(self.router.get_client_for_role("executor"), self.workspace)
-                        report = replace(report, execution_result=await executor.execute(report.architecture))
+                        _pcb_fb = ProjectContextBuilder(self.workspace)
+                        if report.architecture:
+                            _pcb_fb.build_from_architecture(report.architecture)
+                        executor = Executor(self.router.get_client_for_role("executor"), self.workspace, tier_clients=self.router.get_tier_clients("executor"))
+                        _fb_result = await executor.execute(report.architecture)
+                        _pcb_fb.build_from_generated_files(_fb_result.generated_files)
+                        report = replace(report, execution_result=_fb_result)
                 await _save(report)
                 _t1 = time.monotonic()
                 prov, mdl = _role_provider(self.router, "planner")
@@ -710,7 +725,7 @@ class Orchestrator:
                     report.execution_result.generated_files, self.workspace
                 )
                 if _entry_point:
-                    _import_cmd = build_import_check_command(_entry_point)
+                    _import_cmd = build_import_check_command(_entry_point, workspace=self.workspace)
                     _validation_cmds = [_import_cmd] + _validation_cmds
                     print(f"  [StartupGuard] Import smoke-check: {_import_cmd}")
                 static_attempts = []
@@ -802,7 +817,7 @@ class Orchestrator:
             qa_task = None
             visual_task = None
 
-            if not report.qa_report:
+            if not report.qa_report and not self.skip_qa:
                 print("Stage 7: QA Auditing...")
                 qa_task = asyncio.create_task(
                     QAAuditor(
@@ -818,10 +833,17 @@ class Orchestrator:
                     .validate(report.plan.project_name, report.plan.entry_point)
                 )
 
+            _QA_TIMEOUT = int(os.environ.get("CODEGEN_QA_TIMEOUT", "120"))
             _t0_qa = time.monotonic()
             _tw0_qa = time.time()
             if qa_task:
-                report = replace(report, qa_report=await qa_task)
+                try:
+                    qa_result = await asyncio.wait_for(qa_task, timeout=_QA_TIMEOUT)
+                except asyncio.TimeoutError:
+                    print(f"  [QA] Timed out after {_QA_TIMEOUT}s — skipping QA report.")
+                    qa_result = None
+                if qa_result is not None:
+                    report = replace(report, qa_report=qa_result)
                 _t1_qa = time.monotonic()
                 prov, mdl = _role_provider(self.router, "qa_auditor")
                 traces.append(StageTrace(

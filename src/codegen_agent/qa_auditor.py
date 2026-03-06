@@ -299,6 +299,9 @@ class QAAuditor:
 
         approved_raw = data.get("approved", False)
         approved = bool(approved_raw)
+        # If filtering removed all issues the LLM raised, treat as approved
+        if not issues and not approved:
+            approved = True
 
         return {
             "score": score,
@@ -307,25 +310,37 @@ class QAAuditor:
             "approved": approved,
         }
 
-    def _read_source_files(self, report: PipelineReport, max_chars: int = 16_000) -> str:
+    def _read_source_files(self, report: PipelineReport, max_chars: int = 24_000) -> str:
         """Read actual source file contents for the QA LLM to review.
 
-        Prioritises source files over test files, skips binary/config/asset files.
-        Caps total chars so the prompt stays within token budget.
+        Prioritises high-signal files (entry points, auth, routers) over test/config files.
+        Uses head+tail display with a 3000-char cap per file so large files show both
+        the import block AND the business logic at the end.
         """
         _CODE_EXTS = {".py", ".js", ".ts", ".tsx", ".go", ".rs", ".php", ".rb"}
         _SKIP_NAMES = {
             "requirements.txt", "package-lock.json", "go.sum",
             "__init__.py", ".gitignore", "README.md",
         }
+        # Priority tiers: lower = shown first (most important)
+        def _priority(fp: str) -> int:
+            p = fp.lower()
+            if any(k in p for k in ("main.py", "app.py", "run.py", "server.py")):
+                return 0
+            if any(k in p for k in ("auth", "security", "jwt", "token")):
+                return 1
+            if "router" in p or "routes" in p:
+                return 2
+            if any(k in p for k in ("model", "schema", "crud", "database", "db")):
+                return 3
+            if p.endswith("test") or "/tests/" in p:
+                return 6
+            return 4
+
         generated = report.execution_result.generated_files if report.execution_result else []
         test_files = set(report.test_suite.test_files.keys()) if report.test_suite else set()
 
-        # Source files first, then test files, skip tiny/empty/config
-        ordered = sorted(
-            generated,
-            key=lambda f: (f.file_path in test_files, f.file_path),
-        )
+        ordered = sorted(generated, key=lambda f: (_priority(f.file_path), f.file_path))
 
         parts: list[str] = []
         total = 0
@@ -342,10 +357,20 @@ class QAAuditor:
                 content = gf.content
             if not content.strip():
                 continue
-            entry = f"=== {gf.file_path} ===\n{content.strip()}"
+            # High-priority files: 3000-char cap (2400 head + 600 tail) for more context.
+            # Lower-priority files: 1200-char cap to make room for more files.
+            is_critical = _priority(gf.file_path) <= 2
+            cap = 3000 if is_critical else 1200
+            if len(content) > cap:
+                head = int(cap * 0.8)
+                tail = cap - head
+                display = content[:head] + f"\n[... {len(content) - head - tail} chars omitted ...]\n" + content[-tail:]
+            else:
+                display = content.strip()
+            entry = f"=== {gf.file_path} ({content.count(chr(10))+1} lines) ===\n{display}"
             if total + len(entry) > max_chars:
                 remaining = max_chars - total
-                if remaining > 200:
+                if remaining > 400:
                     parts.append(entry[:remaining] + "\n[... truncated ...]")
                 break
             parts.append(entry)

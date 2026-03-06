@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import os
 import logging
 import re
@@ -61,6 +62,41 @@ class DependencyCandidate:
     ecosystem: str
 
 
+def _venv_python(workspace_root: Path) -> str:
+    """Return the quoted path to the project venv Python binary."""
+    return shlex.quote(str(workspace_root / ".venv" / "bin" / "python"))
+
+
+async def _ensure_project_venv(workspace_root: Path) -> None:
+    """Create a .venv inside the project workspace if one doesn't exist yet.
+
+    Always uses the system `python3` to create the venv — never the agent's
+    own venv — so the project gets a clean, independent environment.
+    """
+    venv_python = workspace_root / ".venv" / "bin" / "python"
+    if venv_python.exists():
+        return
+    print("  [DependencyManager] Creating project virtualenv (.venv)...")
+    system_python = shutil.which("python3") or shutil.which("python") or "python3"
+    result = await asyncio.to_thread(
+        run_shell_command,
+        f"{shlex.quote(system_python)} -m venv .venv",
+        str(workspace_root),
+    )
+    if result.exit_code != 0:
+        logger.warning(
+            "Failed to create project venv: %s", result.stderr.strip()[:200]
+        )
+    else:
+        # Upgrade pip inside the new venv silently
+        await asyncio.to_thread(
+            run_shell_command,
+            f"{_venv_python(workspace_root)} -m pip install --quiet --upgrade pip",
+            str(workspace_root),
+        )
+        print("  [DependencyManager] Project virtualenv ready.")
+
+
 class DependencyManager:
     """Attempt to install missing runtime dependencies when validation fails."""
 
@@ -76,8 +112,13 @@ class DependencyManager:
         validation_commands: List[str] | None = None,
     ) -> Dict[str, Any]:
         """Stage 4: Analyze generated files and install inferred dependencies."""
-        import asyncio
         workspace_root = Path(self.workspace).resolve()
+
+        # Always create an isolated .venv for the project so the smoke-check
+        # and all validation commands run against the project's own packages,
+        # not the agent's environment.
+        await _ensure_project_venv(workspace_root)
+        py = _venv_python(workspace_root)
 
         tasks: list = []
         labels: list[str] = []
@@ -89,13 +130,13 @@ class DependencyManager:
 
         if (workspace_root / "requirements.txt").exists():
             print("  [DependencyManager] Installing Python dependencies (requirements.txt)...")
-            cmd = f"{shlex.quote(sys.executable)} -m pip install -r requirements.txt"
+            cmd = f"{py} -m pip install --prefer-binary -r requirements.txt"
             tasks.append(asyncio.to_thread(self.executor, cmd, str(workspace_root)))
             labels.append("requirements.txt")
 
         if (workspace_root / "pyproject.toml").exists():
             print("  [DependencyManager] Installing Python dependencies (pyproject.toml)...")
-            cmd = f"{shlex.quote(sys.executable)} -m pip install ."
+            cmd = f"{py} -m pip install --prefer-binary ."
             tasks.append(asyncio.to_thread(self.executor, cmd, str(workspace_root)))
             labels.append("pyproject.toml")
 
@@ -132,7 +173,7 @@ class DependencyManager:
                 if shutil.which(tool) is not None:
                     continue   # already installed
                 print(f"  [DependencyManager] Installing missing validation tool: {tool}")
-                install_cmd = f"{shlex.quote(sys.executable)} -m pip install {shlex.quote(tool)}"
+                install_cmd = f"{py} -m pip install {shlex.quote(tool)}"
                 try:
                     res = await asyncio.to_thread(self.executor, install_cmd, str(workspace_root))
                     if res.exit_code == 0:
@@ -154,7 +195,7 @@ class DependencyManager:
         )
         if not has_manifest:
             framework_installs = await self._install_inferred_frameworks(
-                generated_files, workspace_root
+                generated_files, workspace_root, py
             )
             results["framework_installs"] = framework_installs
 
@@ -198,7 +239,7 @@ class DependencyManager:
             return False, None
 
         print("  [DependencyManager] Enforcing passlib compatibility: bcrypt==4.0.1")
-        install_cmd = f"{shlex.quote(sys.executable)} -m pip install bcrypt==4.0.1"
+        install_cmd = f"{_venv_python(workspace_root)} -m pip install bcrypt==4.0.1"
         try:
             res = await asyncio.to_thread(self.executor, install_cmd, str(workspace_root))
         except Exception as exc:
@@ -213,10 +254,12 @@ class DependencyManager:
         self,
         generated_files: List[GeneratedFile],
         workspace_root: Path,
+        py: str | None = None,
     ) -> list[str]:
         """Scan generated Python files for known framework imports and install them."""
-        import asyncio
         import importlib.util
+        if py is None:
+            py = _venv_python(workspace_root)
 
         needed: dict[str, str] = {}  # import_name → pip_package
         for f in generated_files:
@@ -241,7 +284,7 @@ class DependencyManager:
         packages = list(needed.values())
         print(f"  [DependencyManager] Installing inferred frameworks: {packages}")
         install_cmd = (
-            f"{shlex.quote(sys.executable)} -m pip install "
+            f"{py} -m pip install "
             + " ".join(shlex.quote(p) for p in packages)
         )
         try:
@@ -340,16 +383,18 @@ class DependencyManager:
         )
         dependency = shlex.quote(candidate.name)
 
+        venv_py = _venv_python(workspace_root)
+
         if candidate.ecosystem == "node" and has_node_project:
             return f"npm install {dependency}"
         if candidate.ecosystem == "python" and has_python_project:
-            return f"{shlex.quote(sys.executable)} -m pip install {dependency}"
+            return f"{venv_py} -m pip install {dependency}"
 
         # Fallback to environment inference when ecosystem hints are weak.
         if has_node_project:
             return f"npm install {dependency}"
         if has_python_project:
-            return f"{shlex.quote(sys.executable)} -m pip install {dependency}"
+            return f"{venv_py} -m pip install {dependency}"
         return None
 
     @staticmethod
@@ -371,6 +416,29 @@ class DependencyManager:
         """
         conftest_path = workspace_root / "conftest.py"
         if conftest_path.exists():
+            # Patch only auto-generated conftest files that are missing sys.path.
+            # A conftest that has pytest imports (TestWriter-generated) but no sys.path
+            # setup will cause every test to fail with ModuleNotFoundError.
+            # Leave user-written conftest files (no pytest imports) untouched.
+            try:
+                existing = conftest_path.read_text(encoding="utf-8")
+                looks_generated = "import pytest" in existing or "import asyncio" in existing
+                if looks_generated and "sys.path" not in existing:
+                    has_src = (workspace_root / "src").is_dir()
+                    preamble = (
+                        "import os\nimport sys\n\n"
+                        "ROOT = os.path.dirname(os.path.abspath(__file__))\n"
+                        "if ROOT not in sys.path:\n    sys.path.insert(0, ROOT)\n"
+                    )
+                    if has_src:
+                        preamble += (
+                            "SRC = os.path.join(ROOT, 'src')\n"
+                            "if SRC not in sys.path:\n    sys.path.insert(0, SRC)\n"
+                        )
+                    conftest_path.write_text(preamble + "\n" + existing)
+                    return True
+            except OSError:
+                pass
             return False
 
         # Root-level .py files that are not test files or conftest itself

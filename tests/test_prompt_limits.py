@@ -11,8 +11,9 @@ def test_truncate_error_output_long_tail_preserved():
     lines = [f"line{i}" for i in range(200)]
     result = _truncate_error_output("\n".join(lines), max_lines=10)
     assert "truncated" in result
-    assert "line199" in result
-    assert "line0" not in result
+    assert "line199" in result  # tail preserved
+    assert "line0" in result    # head preserved (root cause)
+    assert "line100" not in result  # middle dropped
 
 
 def test_cap_file_content_short_unchanged():

@@ -1,0 +1,613 @@
+{
+  "requirements.txt": {
+    "purpose": "Dependency manifest",
+    "exports": [
+      "fastapi",
+      "sqlalchemy",
+      "alembic",
+      "pydantic-settings",
+      "python-jose",
+      "passlib",
+      "bcrypt",
+      "jinja2",
+      "python-multipart"
+    ],
+    "lines": 12
+  },
+  "run.py": {
+    "purpose": "Production entry point",
+    "exports": [
+      "logger",
+      "main"
+    ],
+    "import_from": {
+      "src/main.py": [
+        "app"
+      ]
+    },
+    "lines": 72
+  },
+  "src/main.py": {
+    "purpose": "FastAPI application factory",
+    "exports": [
+      "lifespan",
+      "app",
+      "static_path",
+      "templates",
+      "root"
+    ],
+    "import_from": {
+      "src/db/session.py": [
+        "engine",
+        "AsyncSessionLocal",
+        "get_db"
+      ]
+    },
+    "invariants": [
+      "Static files mounted at /static",
+      "Templates configured with Jinja2"
+    ],
+    "routes": [
+      "GET /"
+    ],
+    "lines": 42
+  },
+  "src/models/user.py": {
+    "purpose": "User and Profile ORM models",
+    "exports": [
+      "Role",
+      "User",
+      "StudentProfile",
+      "TeacherProfile",
+      "StaffProfile",
+      "ParentLink"
+    ],
+    "invariants": [
+      "UUID primary keys",
+      "Unique emails"
+    ],
+    "lines": 70
+  },
+  "src/models/content.py": {
+    "purpose": "LMS Content ORM models",
+    "exports": [
+      "Program",
+      "Course",
+      "Module",
+      "Lesson",
+      "Material"
+    ],
+    "invariants": [
+      "Cascade deletions on module removal"
+    ],
+    "lines": 62
+  },
+  "src/api/v1/auth.py": {
+    "purpose": "Authentication endpoints",
+    "exports": [
+      "router",
+      "login_for_access_token",
+      "refresh_token",
+      "forgot_password",
+      "reset_password"
+    ],
+    "routes": [
+      "POST /login",
+      "POST /refresh",
+      "POST /forgot-password",
+      "POST /reset-password"
+    ],
+    "lines": 81
+  },
+  "static/style.css": {
+    "purpose": "Accessible Design System",
+    "exports": [
+      ":root variables",
+      ".high-contrast",
+      ".dyslexia-font",
+      ".card",
+      ".btn",
+      "nav"
+    ],
+    "invariants": [
+      "WCAG 2.1 AA color contrast compliance",
+      "Fluid typography"
+    ],
+    "lines": 449
+  },
+  "static/app.js": {
+    "purpose": "Frontend Controller",
+    "exports": [
+      "async",
+      "logout",
+      "showToast",
+      "async"
+    ],
+    "import_from": {
+      "static/accessibility.js": [
+        "toggleHighContrast",
+        "toggleDyslexiaFont",
+        "adjustFontSize",
+        "announceToScreenReader"
+      ]
+    },
+    "invariants": [
+      "Token automatically added to Authorization headers"
+    ],
+    "lines": 223
+  },
+  "static/accessibility.js": {
+    "purpose": "A11y Enhancements",
+    "exports": [
+      "toggleHighContrast",
+      "toggleDyslexiaFont",
+      "adjustFontSize",
+      "announceToScreenReader"
+    ],
+    "invariants": [
+      "Persist settings in localStorage"
+    ],
+    "lines": 90
+  },
+  "static/index.html": {
+    "purpose": "Public Landing Page",
+    "exports": [
+      "Skip-to-content link",
+      "Aria-landmarks"
+    ],
+    "import_from": {
+      "static/style.css": [
+        ":root variables",
+        ".high-contrast",
+        ".dyslexia-font",
+        ".card",
+        ".btn",
+        "nav"
+      ],
+      "static/app.js": [
+        "apiFetch",
+        "login",
+        "logout",
+        "renderDashboard"
+      ]
+    },
+    "lines": 128
+  },
+  "seed.py": {
+    "purpose": "Initial Data Seeding",
+    "exports": [
+      "get_password_hash",
+      "seed_db"
+    ],
+    "import_from": {
+      "src/db/session.py": [
+        "engine",
+        "AsyncSessionLocal",
+        "get_db"
+      ],
+      "src/models/user.py": [
+        "User",
+        "Role",
+        "StudentProfile",
+        "TeacherProfile",
+        "StaffProfile",
+        "ParentLink"
+      ],
+      "src/models/content.py": [
+        "Program",
+        "Course",
+        "Module",
+        "Lesson",
+        "Material"
+      ]
+    },
+    "invariants": [
+      "Idempotent execution"
+    ],
+    "lines": 57
+  },
+  "alembic.ini": {
+    "purpose": "Migration configuration",
+    "exports": [],
+    "lines": 41
+  },
+  "src/db/session.py": {
+    "purpose": "SQLAlchemy Engine & Session",
+    "exports": [
+      "engine",
+      "AsyncSessionLocal",
+      "get_db"
+    ],
+    "invariants": [
+      "expire_on_commit=False"
+    ],
+    "lines": 34
+  },
+  "README.md": {
+    "purpose": "Project documentation",
+    "exports": [],
+    "lines": 33
+  },
+  "src/__init__.py": {
+    "purpose": "Empty Python package marker",
+    "exports": []
+  },
+  "src/core/__init__.py": {
+    "purpose": "Empty Python package marker",
+    "exports": []
+  },
+  "src/core/config.py": {
+    "purpose": "Supporting file: config.py",
+    "exports": [
+      "Settings",
+      "settings"
+    ],
+    "lines": 35
+  },
+  "src/core/security.py": {
+    "purpose": "Supporting file: security.py",
+    "exports": [
+      "ALGORITHM",
+      "create_access_token",
+      "verify_password",
+      "get_password_hash"
+    ],
+    "lines": 26
+  },
+  "src/core/deps.py": {
+    "purpose": "Supporting file: deps.py",
+    "exports": [
+      "oauth2_scheme",
+      "get_current_user",
+      "get_current_active_superuser"
+    ],
+    "lines": 52
+  },
+  "src/core/middleware.py": {
+    "purpose": "Supporting file: middleware.py",
+    "exports": [
+      "setup_middleware"
+    ],
+    "lines": 14
+  },
+  "src/db/__init__.py": {
+    "purpose": "Empty Python package marker",
+    "exports": []
+  },
+  "src/db/base_class.py": {
+    "purpose": "Supporting file: base_class.py",
+    "exports": [
+      "Base"
+    ],
+    "lines": 13
+  },
+  "src/models/__init__.py": {
+    "purpose": "Empty Python package marker",
+    "exports": [],
+    "lines": 2
+  },
+  "src/models/interaction.py": {
+    "purpose": "Supporting file: interaction.py",
+    "exports": [
+      "StudentCourseEnrollment",
+      "Attendance",
+      "Submission",
+      "Assessment"
+    ],
+    "lines": 51
+  },
+  "src/models/logging.py": {
+    "purpose": "Supporting file: logging.py",
+    "exports": [
+      "AuditLog",
+      "SystemError",
+      "UserActivity"
+    ],
+    "lines": 36
+  },
+  "src/schemas/__init__.py": {
+    "purpose": "Empty Python package marker",
+    "exports": [],
+    "lines": 2
+  },
+  "src/schemas/user.py": {
+    "purpose": "Supporting file: user.py",
+    "exports": [
+      "UserBase",
+      "UserCreate",
+      "UserUpdate",
+      "UserInDB",
+      "User",
+      "ProfileBase",
+      "StudentProfileSchema",
+      "TeacherProfileSchema"
+    ],
+    "lines": 44
+  },
+  "src/schemas/content.py": {
+    "purpose": "Supporting file: content.py",
+    "exports": []
+  },
+  "src/schemas/assessment.py": {
+    "purpose": "Supporting file: assessment.py",
+    "exports": [
+      "AssessmentType",
+      "QuestionType",
+      "SubmissionStatus",
+      "ChoiceBase",
+      "ChoiceCreate",
+      "Choice",
+      "QuestionBase",
+      "QuestionCreate",
+      "QuestionUpdate",
+      "Question",
+      "AssessmentBase",
+      "AssessmentCreate",
+      "AssessmentUpdate",
+      "Assessment",
+      "AssessmentDetail",
+      "AnswerSubmission",
+      "SubmissionCreate",
+      "SubmissionUpdate",
+      "AnswerRead",
+      "Submission",
+      "AssessmentResult",
+      "GradingSchema"
+    ],
+    "lines": 163
+  },
+  "src/schemas/cms.py": {
+    "purpose": "Supporting file: cms.py",
+    "exports": [
+      "CMSBase",
+      "CMSCreate",
+      "CMSUpdate",
+      "CMSRead",
+      "PageBase",
+      "PageCreate",
+      "PageUpdate",
+      "PageRead",
+      "AnnouncementBase",
+      "AnnouncementCreate",
+      "AnnouncementUpdate",
+      "AnnouncementRead",
+      "MediaBase",
+      "MediaRead",
+      "NavigationItem",
+      "NavigationMenu",
+      "CMSStats"
+    ],
+    "lines": 138
+  },
+  "src/api/__init__.py": {
+    "purpose": "Empty Python package marker",
+    "exports": [],
+    "lines": 2
+  },
+  "src/api/v1/__init__.py": {
+    "purpose": "Empty Python package marker",
+    "exports": [],
+    "lines": 2
+  },
+  "src/api/v1/users.py": {
+    "purpose": "Supporting file: users.py",
+    "exports": [
+      "router",
+      "read_user_me",
+      "update_user_me",
+      "read_users"
+    ],
+    "routes": [
+      "GET /me",
+      "PUT /me",
+      "GET /"
+    ],
+    "lines": 47
+  },
+  "src/api/v1/programs.py": {
+    "purpose": "Supporting file: programs.py",
+    "exports": [
+      "router",
+      "list_courses",
+      "create_course",
+      "get_course"
+    ],
+    "routes": [
+      "GET /",
+      "POST /",
+      "GET /{course_id}"
+    ],
+    "lines": 53
+  },
+  "src/api/v1/assessments.py": {
+    "purpose": "Supporting file: assessments.py",
+    "exports": [
+      "router",
+      "create_assessment",
+      "submit_assessment",
+      "grade_submission"
+    ],
+    "routes": [
+      "POST /",
+      "POST /{assessment_id}/submit",
+      "PATCH /submissions/{submission_id}/grade"
+    ],
+    "lines": 70
+  },
+  "src/api/v1/attendance.py": {
+    "purpose": "Supporting file: attendance.py",
+    "exports": [
+      "router",
+      "mark_attendance",
+      "get_student_attendance"
+    ],
+    "routes": [
+      "POST /",
+      "GET /student/{student_id}"
+    ],
+    "lines": 47
+  },
+  "src/api/v1/cms.py": {
+    "purpose": "Supporting file: cms.py",
+    "exports": [
+      "router",
+      "get_announcements",
+      "create_announcement"
+    ],
+    "routes": [
+      "GET /announcements",
+      "POST /announcements"
+    ],
+    "lines": 40
+  },
+  "src/api/v1/notifications.py": {
+    "purpose": "Supporting file: notifications.py",
+    "exports": [
+      "router",
+      "NotificationSchema",
+      "get_notifications",
+      "mark_as_read",
+      "delete_notification"
+    ],
+    "routes": [
+      "GET /",
+      "POST /{notification_id}/read",
+      "DELETE /{notification_id}"
+    ],
+    "lines": 54
+  },
+  "src/api/v1/admin.py": {
+    "purpose": "Supporting file: admin.py",
+    "exports": [
+      "router",
+      "check_admin_role",
+      "get_system_stats",
+      "toggle_user_status"
+    ],
+    "routes": [
+      "GET /stats",
+      "POST /users/{user_id}/toggle-status"
+    ],
+    "lines": 56
+  },
+  "src/services/__init__.py": {
+    "purpose": "Empty Python package marker",
+    "exports": [],
+    "lines": 1
+  },
+  "src/services/auth_service.py": {
+    "purpose": "Supporting file: auth_service.py",
+    "exports": [
+      "SECRET_KEY",
+      "ALGORITHM",
+      "ACCESS_TOKEN_EXPIRE_MINUTES",
+      "AuthService"
+    ],
+    "lines": 45
+  },
+  "src/services/course_service.py": {
+    "purpose": "Supporting file: course_service.py",
+    "exports": [
+      "CourseService"
+    ],
+    "lines": 32
+  },
+  "src/services/grading_service.py": {
+    "purpose": "Supporting file: grading_service.py",
+    "exports": [
+      "GradingService"
+    ],
+    "lines": 39
+  },
+  "static/login.html": {
+    "purpose": "Supporting file: login.html",
+    "exports": [],
+    "lines": 69
+  },
+  "static/dashboard_student.html": {
+    "purpose": "Supporting file: dashboard_student.html",
+    "exports": [],
+    "lines": 113
+  },
+  "static/dashboard_teacher.html": {
+    "purpose": "Supporting file: dashboard_teacher.html",
+    "exports": [],
+    "lines": 115
+  },
+  "static/dashboard_admin.html": {
+    "purpose": "Supporting file: dashboard_admin.html",
+    "exports": [],
+    "lines": 126
+  },
+  "static/dashboard_staff.html": {
+    "purpose": "Supporting file: dashboard_staff.html",
+    "exports": [],
+    "lines": 94
+  },
+  "static/dashboard_parent.html": {
+    "purpose": "Supporting file: dashboard_parent.html",
+    "exports": [],
+    "lines": 98
+  },
+  "alembic/env.py": {
+    "purpose": "Supporting file: env.py",
+    "exports": [
+      "config",
+      "target_metadata",
+      "run_migrations_offline",
+      "do_run_migrations",
+      "run_migrations_online"
+    ],
+    "lines": 63
+  },
+  "alembic/script.py.mako": {
+    "purpose": "Supporting file: script.py.mako",
+    "exports": [],
+    "lines": 18
+  },
+  "alembic/versions/": {
+    "purpose": "Supporting file: ",
+    "exports": []
+  },
+  "tests/__init__.py": {
+    "purpose": "Empty Python package marker",
+    "exports": [],
+    "lines": 1
+  },
+  "tests/conftest.py": {
+    "purpose": "Supporting file: conftest.py",
+    "exports": [
+      "DATABASE_URL",
+      "engine",
+      "TestingSessionLocal",
+      "event_loop",
+      "setup_db",
+      "db_session",
+      "client"
+    ],
+    "lines": 36
+  },
+  "tests/test_auth.py": {
+    "purpose": "Supporting file: test_auth.py",
+    "exports": [
+      "test_user_registration_and_login",
+      "test_invalid_login"
+    ],
+    "lines": 38
+  },
+  "tests/test_rbac.py": {
+    "purpose": "Supporting file: test_rbac.py",
+    "exports": [
+      "test_admin_access_to_stats",
+      "test_student_denied_admin_access"
+    ],
+    "lines": 38
+  },
+  "tests/test_assessments.py": {
+    "purpose": "Supporting file: test_assessments.py",
+    "exports": [
+      "test_get_assessments_endpoint"
+    ],
+    "lines": 13
+  }
+}
