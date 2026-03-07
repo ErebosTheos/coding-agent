@@ -70,14 +70,12 @@ ARCHITECTURE RULES:
 
 PLAN RULES:
 - For any project with a user-facing interface, the "features" list MUST include explicit frontend
-  feature entries — not just backend features. Add entries like:
-    {"id": "F-UI-1", "title": "Public Landing Page", "description": "Full landing page: hero, programs, stats, testimonials, contact form, footer.", "priority": 1}
-    {"id": "F-UI-2", "title": "Authentication UI", "description": "Login page with role selector, error handling, redirect to dashboard.", "priority": 1}
-    {"id": "F-UI-3", "title": "Student Dashboard UI", "description": "Sidebar layout: courses, tests, results, attendance, notifications.", "priority": 2}
-    {"id": "F-UI-4", "title": "Teacher Dashboard UI", "description": "Lesson builder, test creator, grading panel, student performance table.", "priority": 2}
-    {"id": "F-UI-5", "title": "Admin Dashboard UI", "description": "User management, analytics charts, audit logs, course management.", "priority": 2}
-  Add whichever UI features are relevant. Frontend features must appear in the plan so the
-  architect knows to include them as architecture nodes.
+  feature entries — not just backend features. Derive them from the brief. Generic examples:
+    {"id": "F-UI-1", "title": "Public Landing Page", "description": "Hero, feature highlights, CTA, footer.", "priority": 1}
+    {"id": "F-UI-2", "title": "Authentication UI", "description": "Login page, error handling, redirect to dashboard.", "priority": 1}
+    {"id": "F-UI-3", "title": "<Role> Dashboard UI", "description": "Sidebar, stat cards, data panels relevant to this role.", "priority": 2}
+  Replace <Role> with actual roles from the brief. Add one F-UI entry per distinct role or major view.
+  Frontend features must appear in the plan so the architect knows to include them as nodes.
 
 FRONTEND RULES (mandatory for any project with a user-facing interface):
 - If the request mentions: website, portal, dashboard, frontend, UI, public page, login page,
@@ -91,7 +89,7 @@ FRONTEND RULES (mandatory for any project with a user-facing interface):
     static/dashboard.html  — authenticated dashboard (loads after login)
     templates/base.html    — optional Jinja2 base template if using server-side rendering
   AND wire them in main.py / app.py:
-    app.mount("/static", StaticFiles(directory="static"), name="static")
+    app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
     @app.get("/", response_class=HTMLResponse) → serve static/index.html
 - For Node/Express backends: serve static/ with express.static() and include the same files.
 - The HTML must be real, complete, and production-quality — NOT a placeholder or stub.
@@ -112,14 +110,18 @@ Respond ONLY with the raw JSON object. No markdown fences, no commentary."""
 
 COMBINED_USER_PROMPT = """User Request: {prompt}
 
-IMPORTANT — BE AMBITIOUS AND THOROUGH:
-- Do NOT produce a minimal feature set. Extract EVERY possible feature implied by the request.
-- If the request mentions a dashboard, plan ALL the panels (stats, tables, charts, forms, filters).
-- If the request mentions users/roles, plan ALL CRUD operations, profile pages, settings per role.
-- If the request mentions courses/content, plan lesson viewer, progress tracking, certificates, bookmarks.
-- If the request mentions tests/assessments, plan question types, timer, auto-submit, result breakdown, leaderboard.
-- If the request mentions analytics, plan charts, export, filters, date ranges.
-- Aim for 8-15 backend features and 5-8 frontend UI features MINIMUM. More is always better.
+IMPORTANT — BE THOROUGH BUT FOCUSED:
+- Extract every feature explicitly stated in the request. Do not skip named modules.
+- RESOURCE COMPLETENESS RULE: For EVERY resource named in the brief, generate the full backend stack:
+    1. Model file:   src/models/<resource>.py  — SQLAlchemy ORM class
+    2. Schema file:  src/schemas/<resource>.py  — Pydantic request/response schemas
+    3. Router file:  src/api/routers/<resource>.py — CRUD endpoints
+  Never generate a UI that references a resource without its backend model + router.
+  Never generate a read endpoint without the corresponding write endpoint.
+  Never generate a dashboard panel for a feature without the API that powers it.
+- Aim for 8-15 backend features and 5-8 frontend UI features. Keep total file count under 55 —
+  more files means more batches, more cross-file drift, and more failures. Prefer fewer, complete
+  files over many partial ones. Only add a file if it has a distinct, non-trivial responsibility.
 - Every role gets its own dashboard HTML page as a planned architecture node.
 - NEVER merge multiple routers into one file — each resource gets its own router file.
 - NEVER skip seed files, config files, utility modules, middleware, or migration scripts.
@@ -127,11 +129,11 @@ IMPORTANT — BE AMBITIOUS AND THOROUGH:
 MANDATORY FRONTEND ARCHITECTURE:
 For ANY project with a UI, the architecture MUST include ALL of these nodes:
   static/index.html     — public landing page (hero, features, stats, testimonials, footer)
-  static/login.html     — login page with role selector and JWT auth
+  static/login.html     — login page with JWT auth (add role selector only if multiple roles exist)
   static/style.css      — complete design system (300+ lines, dark theme, all components)
   static/app.js         — all interactivity (auth flow, API calls, charts, tables, 200+ lines)
   static/dashboard.html — main authenticated dashboard
-  AND separate dashboard pages for each role mentioned (student, teacher, admin, staff, parent).
+  AND separate dashboard pages for each distinct role mentioned in the brief.
 
 The frontend plan features MUST include explicit entries:
   F-UI-1: Public Landing Page, F-UI-2: Authentication UI, F-UI-3..N: each role's dashboard.
@@ -235,24 +237,44 @@ class PlannerArchitect:
             return plan
 
         # Synthesize feature entries from the actual frontend files planned
-        _MAP = [
-            (("index.html", "templates/index"), "F-UI-1", "Public Landing Page", "Full landing page: hero section, feature cards, navigation, footer."),
-            (("login", "auth"), "F-UI-2", "Authentication UI", "Login page with role selector, JWT auth flow, error handling, redirect to dashboard."),
-            (("student",), "F-UI-3", "Student Dashboard UI", "Student sidebar: courses, tests, results, progress tracking, notifications."),
-            (("teacher", "instructor"), "F-UI-4", "Teacher Dashboard UI", "Lesson builder, test creator, grading panel, student performance table."),
-            (("admin",), "F-UI-5", "Admin Control Panel UI", "User management, analytics charts, audit logs, course management."),
-            (("staff",), "F-UI-6", "Staff Dashboard UI", "Staff-specific panels and workflows."),
+        # Fixed entries for universal pages
+        _FIXED_MAP = [
+            (("index.html", "templates/index"), "F-UI-1", "Public Landing Page", "Hero section, feature highlights, CTA, footer."),
+            (("login", "auth"), "F-UI-2", "Authentication UI", "Login page, JWT auth flow, error handling, redirect to dashboard."),
             (("style.css", "theme"), "F-UI-7", "Responsive CSS Design System", "Mobile-first CSS with dark theme, grid layout, accessible components."),
             (("app.js", "main.js"), "F-UI-8", "Frontend JavaScript", "JWT auth, API fetch wrappers, navigation, real-time updates."),
         ]
         next_priority = max((f.priority for f in plan.features), default=2)
         synth_features = list(plan.features)
         seen_ids = {f.id for f in plan.features}
-        for keywords, fid, title, desc in _MAP:
+
+        for keywords, fid, title, desc in _FIXED_MAP:
             if fid in seen_ids:
                 continue
             if any(any(k in n.file_path.lower() for k in keywords) for n in frontend_nodes):
                 synth_features.append(Feature(id=fid, title=title, description=desc, priority=next_priority))
                 seen_ids.add(fid)
+
+        # Dynamic entries: derive dashboard features from actual dashboard filenames
+        ui_counter = 3
+        for node in frontend_nodes:
+            import os
+            fname = os.path.splitext(os.path.basename(node.file_path))[0].lower()
+            if "dashboard" not in fname and "panel" not in fname:
+                continue
+            # Derive a human title from the filename: dashboard_manager → Manager Dashboard UI
+            role_part = fname.replace("dashboard_", "").replace("_dashboard", "").replace("dashboard", "").strip("_")
+            role_title = role_part.replace("_", " ").title() if role_part else "Main"
+            title = f"{role_title} Dashboard UI"
+            if any(f.title == title for f in synth_features):
+                continue
+            # Find next available F-UI-N id, skipping any already claimed
+            while f"F-UI-{ui_counter}" in seen_ids:
+                ui_counter += 1
+            fid = f"F-UI-{ui_counter}"
+            desc = f"{role_title} dashboard: sidebar navigation, stat cards, data panels relevant to this role."
+            synth_features.append(Feature(id=fid, title=title, description=desc, priority=next_priority))
+            seen_ids.add(fid)
+            ui_counter += 1
 
         return dataclasses.replace(plan, features=synth_features)

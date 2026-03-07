@@ -24,3 +24,6 @@ where = ["src"]
 testpaths = ["tests"]
 norecursedirs = ["Legacy Reference", "benchmark_output", "test_output", ".venv", ".git"]
 asyncio_mode = "auto"
+markers = [
+    "smoke: fast startup and import smoke checks",
+]

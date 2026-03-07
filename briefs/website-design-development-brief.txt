@@ -1,0 +1,85 @@
+DRISHTIKON FOUNDATION DIGITAL PLATFORM BRIEF - PROJECT NAME
+
+1. PROJECT OVERVIEW
+Name: Drishtikon Foundation Portal
+Purpose: A dual-purpose platform serving as a public advocacy site and a specialized Learning Management System (LMS) for visually impaired (VI) individuals.
+Target Audience: VI Students, specialized educators, NGO staff, and donors.
+Core Value: Radical accessibility (WCAG 2.1 AA) ensuring every interaction is screen-reader and keyboard-first.
+
+2. USER ROLES
+- Public/Donor: View programs, read success stories, donate. No login.
+- Student: Access curriculum, take weekly tests, view progress.
+- Teacher: Upload lesson plans, grade descriptive tests, manage attendance.
+- Staff: Track student support metrics and generate operational reports.
+- Admin: Full system control, user management, and CMS for public pages.
+- Parent: View-only access to their child’s progress and attendance.
+
+3. PUBLIC PAGES (No Login)
+- Home (/) : High-contrast hero section with "Skip to Content", mission statement, and primary CTAs (Donate/Login).
+- About Us (/about): Narrative of mission/vision and staff profiles with alt-text heavy imagery.
+- Programs (/programs): Cards detailing Fundamental Computer, Mobility, English, and Life Skills.
+- Success Stories (/stories): Accessible blog-style feed of student achievements.
+- Donate (/donate): Simplified form with clear field labels and ARIA live regions for error handling.
+- Contact (/contact): Accessible form and direct "Click to Call" links.
+
+4. AUTHENTICATED PAGES (Dashboards)
+
+STUDENT ROLE (/dashboard/student)
+- Overview: Vertical list layout. Data: Enrolled courses, upcoming tests, recent grades.
+- Course Viewer (/student/courses/[id]): Accordion style for modules. Actions: Download Audio/PDF/DOCX, mark as complete.
+- Test Center (/student/tests): Table of available tests. Button: "Start Timed Assessment".
+- Progress (/student/analytics): Text-based summary of grades (e.g., "Average Score: 85%") and screen-reader friendly tables.
+
+TEACHER ROLE (/dashboard/teacher)
+- Classroom Manager: Card view of assigned courses. Actions: "Add Lesson Plan", "View Attendance".
+- Grading Queue (/teacher/grading): List of pending descriptive submissions. Modal: Text editor for feedback and numeric score input.
+- Test Creator (/teacher/tests/new): Multi-step form for MCQ and descriptive questions. Action: "Publish to Class".
+
+ADMIN ROLE (/dashboard/admin)
+- User Management: Searchable data table of all users. Actions: "Reset Password", "Change Role", "Deactivate".
+- CMS Portal: Forms to update public site text and gallery images.
+- System Audit: List of login activities and data backup timestamps.
+
+5. KEY USER FLOWS
+- Student Taking a Test: 
+  1. Login -> 2. Select "Test Center" -> 3. Select Active Test -> 4. Audible/Visual countdown starts -> 5. Navigate questions via 'Tab' -> 6. 'Submit' with ARIA-alert confirmation.
+- Teacher Adding Content: 
+  1. Login -> 2. Select Course -> 3. Click "Upload Material" -> 4. Select file and add mandatory Alt-Text description -> 5. Notify Students (Toggle).
+- Admin Onboarding: 
+  1. Login -> 2. "Add User" -> 3. Enter details and assign "Student" role -> 4. Assign to "Mobility Training" group -> 5. System sends accessible welcome email.
+
+6. UI COMPONENTS NEEDED
+- Navigation: Skip-link, High-Contrast Toggle, Font-Resizer.
+- Feedback: ARIA-Live Toast notifications (success/error).
+- Forms: Fieldsets with legends, explicit <label> tags, aria-describedby for errors.
+- Layout: 1-column mobile-friendly flow, Card-based dashboards, Accessible Data Tables.
+- Media: Custom audio player with keyboard shortcuts.
+
+7. DATA & FEATURES
+- Entities: User (Role, Accessibility Prefs), Course (Modules, Materials), Test (Questions, Timer), Result (Score, Feedback).
+- Rules: Tests auto-submit on timer expiry; Materials must have text descriptions; Roles are strictly isolated.
+
+8. FILE STRUCTURE
+/
+├── public/                 # Static assets & Accessibility config
+│   ├── css/
+│   │   ├── main.css        # Base styles
+│   │   ├── accessibility.css # High contrast & dyslexia fonts
+│   │   └── theme.css
+│   └── js/
+│       ├── screen-reader.js # ARIA live region helpers
+│       └── app.js
+├── templates/              # HTML Structure (Server-side rendered for SEO/Speed)
+│   ├── base.html           # Master layout with skip-links
+│   ├── public/             # Home, About, Programs, Donate
+│   └── portal/
+│       ├── student_dash.html
+│       ├── teacher_dash.html
+│       ├── admin_dash.html
+│       └── test_interface.html
+├── src/                    # Backend Logic (Python/Django)
+│   ├── models.py           # User, Course, Test, Submission
+│   ├── views/              # Role-based routing
+│   ├── forms.py            # Custom accessible form definitions
+│   └── middleware/         # Security & Role-Based Access Control (RBAC)
+└── tests/                  # Automated accessibility & unit tests

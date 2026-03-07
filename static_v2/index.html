@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Codegen Agent V2</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+
+<div class="app">
+
+  <!-- TOPBAR -->
+  <header class="topbar">
+    <div class="topbar-logo">
+      <svg viewBox="0 0 28 28" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M14 2L25.26 8.5V21.5L14 28L2.74 21.5V8.5L14 2Z" fill="none" stroke="var(--primary)" stroke-width="1.5"/>
+        <path d="M14 7L20.5 10.75V18.25L14 22L7.5 18.25V10.75L14 7Z" fill="var(--primary)" opacity="0.3"/>
+        <circle cx="14" cy="14" r="3" fill="var(--primary)"/>
+      </svg>
+      <span class="name">Codegen</span>
+      <span class="badge">V2</span>
+    </div>
+    <div class="topbar-spacer"></div>
+    <div class="topbar-stats" id="topbar-stats" style="display:none">
+      <div class="topbar-stat">
+        <span class="val" id="stat-files-planned">—</span>
+        <span class="lbl">Planned</span>
+      </div>
+      <div class="topbar-stat">
+        <span class="val" id="stat-files-done">0</span>
+        <span class="lbl">Written</span>
+      </div>
+    </div>
+    <span class="status-badge status-QUEUED" id="global-status">IDLE</span>
+    <button class="btn-gen-brief" id="btn-gen-brief">✦ Generate Brief</button>
+    <button class="btn-new" id="btn-new-project">+ New Project</button>
+  </header>
+
+  <!-- SIDEBAR -->
+  <aside class="sidebar">
+    <!-- Tabs -->
+    <div class="sidebar-tabs">
+      <button class="sidebar-tab active" id="tab-projects" data-tab="projects">
+        Projects
+        <span class="sidebar-count" id="project-count">0</span>
+      </button>
+      <button class="sidebar-tab" id="tab-briefs" data-tab="briefs">
+        Briefs
+        <span class="sidebar-count" id="brief-count">0</span>
+      </button>
+    </div>
+
+    <!-- Projects panel -->
+    <div class="sidebar-panel" id="panel-projects">
+      <ul class="project-list" id="project-list">
+        <li class="project-item" style="color:var(--text-subtle);font-size:12px;padding:16px;pointer-events:none">
+          No projects yet
+        </li>
+      </ul>
+      <!-- Source of truth manifest shown when project is active -->
+      <div class="manifest-panel" id="manifest-panel" style="display:none">
+        <div class="manifest-title">
+          <span class="dot"></span>
+          Source of Truth
+        </div>
+        <div id="manifest-chips"></div>
+      </div>
+    </div>
+
+    <!-- Briefs panel -->
+    <div class="sidebar-panel hidden" id="panel-briefs">
+      <div class="briefs-toolbar">
+        <span class="briefs-hint">Drag a brief onto the main panel to build</span>
+        <button class="btn-gen-brief-sm" id="btn-gen-brief-sm">+ Generate</button>
+      </div>
+      <ul class="brief-list" id="brief-list">
+        <li class="brief-empty">No briefs yet — click Generate to create one</li>
+      </ul>
+    </div>
+  </aside>
+
+  <!-- MAIN -->
+  <main class="main" id="main-panel">
+
+    <!-- DROP ZONE overlay (shown during brief drag) -->
+    <div class="drop-zone" id="drop-zone">
+      <div class="drop-zone-inner">
+        <svg viewBox="0 0 48 48" fill="none" width="48" height="48">
+          <path d="M24 4L42 14V34L24 44L6 34V14L24 4Z" stroke="currentColor" stroke-width="1.5" fill="none"/>
+          <path d="M24 16v16M16 24h16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+        </svg>
+        <p>Drop brief to build project</p>
+      </div>
+    </div>
+
+    <!-- EMPTY STATE -->
+    <div class="empty-state" id="empty-state">
+      <svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M32 4L59 19.5V44.5L32 60L5 44.5V19.5L32 4Z" stroke="currentColor" stroke-width="1.5" fill="none"/>
+        <path d="M32 16L46 24V40L32 48L18 40V24L32 16Z" fill="currentColor" opacity="0.1"/>
+        <circle cx="32" cy="32" r="6" fill="currentColor" opacity="0.3"/>
+      </svg>
+      <h2>Nothing building yet</h2>
+      <p>Click <strong>+ New Project</strong> to start from scratch, or <strong>✦ Generate Brief</strong> to expand your idea into a structured spec first.</p>
+    </div>
+
+    <!-- PROJECT DETAIL (shown when project selected) -->
+    <div class="project-detail" id="project-detail" style="display:none;flex:1;flex-direction:column;overflow:hidden">
+
+      <!-- detail header -->
+      <div class="detail-header">
+        <span class="proj-name" id="proj-name">Untitled Project</span>
+        <div class="proj-meta">
+          <span class="timer" id="stat-duration">—</span>
+          <div class="qa-badge" id="qa-badge">QA —</div>
+          <button class="btn-retry hidden" id="btn-retry" title="Rebuild this project">↺ Retry</button>
+          <button class="btn-delete-proj" id="btn-delete-proj" title="Delete this project">🗑 Delete</button>
+        </div>
+      </div>
+
+      <!-- layer strip -->
+      <div class="layer-strip">
+        <div class="layer-strip-title">Execution Layers</div>
+        <div class="layers-row" id="layers-row">
+          <div class="layer-seg" data-layer="1" title="Layer 1 — Foundation">
+            <span class="l-num">1</span>
+            <span class="l-name">Foundation</span>
+          </div>
+          <div class="layer-seg" data-layer="2" title="Layer 2 — Models">
+            <span class="l-num">2</span>
+            <span class="l-name">Models</span>
+          </div>
+          <div class="layer-seg" data-layer="3" title="Layer 3 — Schemas">
+            <span class="l-num">3</span>
+            <span class="l-name">Schemas</span>
+          </div>
+          <div class="layer-seg" data-layer="4" title="Layer 4 — Core">
+            <span class="l-num">4</span>
+            <span class="l-name">Core</span>
+          </div>
+          <div class="layer-seg" data-layer="5" title="Layer 5 — API">
+            <span class="l-num">5</span>
+            <span class="l-name">API</span>
+          </div>
+          <div class="layer-seg" data-layer="6" title="Layer 6 — Frontend &amp; Tests">
+            <span class="l-num">6</span>
+            <span class="l-name">Frontend</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- content area: files + log -->
+      <div class="content-area">
+
+        <!-- files panel -->
+        <div class="files-panel" id="files-panel">
+          <div class="panel-section-title">
+            Files
+            <span class="section-count" id="file-count">0</span>
+            <input class="file-search" id="file-search" placeholder="filter…" autocomplete="off" />
+          </div>
+          <div class="file-grid" id="file-grid">
+            <!-- file cards injected by JS -->
+          </div>
+        </div>
+
+        <!-- log panel -->
+        <div class="log-panel">
+          <div class="log-header">
+            Live Log
+            <button class="log-clear" id="btn-clear-log">Clear</button>
+          </div>
+          <div class="log-body" id="log-body">
+            <div class="log-line"><span class="ll-text" style="color:var(--text-subtle)">Waiting for events…</span></div>
+          </div>
+        </div>
+
+      </div><!-- /.content-area -->
+
+    </div><!-- /#project-detail -->
+
+  </main>
+
+</div><!-- /.app -->
+
+<!-- ── GENERATE BRIEF MODAL ── -->
+<div class="modal-overlay" id="gen-brief-overlay">
+  <div class="modal gen-brief-modal">
+    <div class="gen-brief-head">
+      <div class="gen-brief-icon">
+        <svg viewBox="0 0 20 20" fill="none" width="16" height="16">
+          <path d="M10 1.5L17.5 5.75V14.25L10 18.5L2.5 14.25V5.75L10 1.5Z" stroke="var(--accent)" stroke-width="1.5" fill="none"/>
+          <circle cx="10" cy="10" r="2.5" fill="var(--accent)"/>
+        </svg>
+      </div>
+      <div>
+        <h2>Generate Brief</h2>
+        <p>Describe your idea — the AI writes a complete spec ready to build.</p>
+      </div>
+      <button class="modal-close" id="btn-cancel-brief" style="margin-left:auto">✕</button>
+    </div>
+
+    <textarea
+      id="brief-raw-input"
+      class="gen-brief-input"
+      placeholder="What are you building?
+
+e.g. An LMS for Drishtikon Foundation — a nonprofit for visually impaired students. Roles: Admin, Teacher, Student, Staff, Parent. 4 course programs, weekly tests, attendance, results, WCAG 2.1 AA accessibility with screen reader support."
+    ></textarea>
+
+    <div class="gen-brief-footer">
+      <span class="gen-brief-hint">⌘↵ to generate</span>
+      <div style="display:flex;gap:8px">
+        <button class="btn-cancel" id="btn-cancel-brief-2">Cancel</button>
+        <button class="btn-submit gen-brief-submit" id="btn-generate-brief">
+          <span class="btn-text">Generate Brief</span>
+          <span class="spinner"></span>
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── BRIEF EDITOR MODAL ── -->
+<div class="modal-overlay" id="brief-editor-overlay">
+  <div class="modal brief-editor-modal">
+    <div class="viewer-header">
+      <span class="viewer-title" id="brief-editor-title">Brief</span>
+      <div class="viewer-actions">
+        <button class="btn-copy" id="btn-copy-brief">Copy</button>
+        <button class="btn-submit" id="btn-save-brief" style="padding:4px 14px;font-size:12px">Save</button>
+        <button class="modal-close" id="brief-editor-close">✕</button>
+      </div>
+    </div>
+    <textarea class="brief-editor-area" id="brief-editor-area"></textarea>
+  </div>
+</div>
+
+<!-- ── BUILD FROM BRIEF CONFIRMATION MODAL ── -->
+<div class="modal-overlay" id="build-brief-overlay">
+  <div class="modal">
+    <h2>Build from Brief</h2>
+    <p>The following brief will be sent to the agent. Review it, then click Build.</p>
+    <div class="brief-preview" id="build-brief-preview"></div>
+    <div class="modal-actions">
+      <button class="btn-cancel" id="btn-cancel-build">Cancel</button>
+      <button class="btn-submit" id="btn-confirm-build">
+        <span class="btn-text">Build Project</span>
+        <span class="spinner"></span>
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- ── NEW PROJECT MODAL (manual brief) ── -->
+<div class="modal-overlay" id="modal-overlay">
+  <div class="modal">
+    <h2>Describe your project</h2>
+    <p>Be specific — list every resource, role, and feature you need.</p>
+    <textarea
+      id="brief-input"
+      placeholder="e.g. A multi-role school LMS with students, teachers, and an admin. Include attendance tracking, grade management, and a notification system."
+    ></textarea>
+    <div class="modal-actions">
+      <button class="btn-cancel" id="btn-cancel">Cancel</button>
+      <button class="btn-submit" id="btn-build">
+        <span class="btn-text">Build Project</span>
+        <span class="spinner"></span>
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- FILE VIEWER MODAL -->
+<div class="modal-overlay" id="viewer-overlay">
+  <div class="modal viewer-modal">
+    <div class="viewer-header">
+      <span class="viewer-title" id="viewer-title"></span>
+      <div class="viewer-actions">
+        <button class="btn-copy" id="btn-copy-file" title="Copy to clipboard">Copy</button>
+        <button class="modal-close" id="viewer-close">✕</button>
+      </div>
+    </div>
+    <pre class="viewer-pre" id="viewer-pre"></pre>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -148,7 +148,7 @@ _VALID_LAST_WORDS = frozenset({
     'true', 'false', 'none', 'and', 'or', 'not', 'in', 'is',
 })
 # How many files per stream-bulk batch (prevents LLM context overflow on large projects)
-_STREAM_CHUNK_SIZE = int(os.environ.get("CODEGEN_STREAM_CHUNK_SIZE", "15"))
+_STREAM_CHUNK_SIZE = int(os.environ.get("CODEGEN_STREAM_CHUNK_SIZE", "10"))
 # Minimum line counts by extension; files below this are re-generated individually
 _MIN_LINES: dict[str, int] = {
     ".html": 40, ".css": 60, ".js": 30, ".ts": 25, ".tsx": 25,
@@ -188,6 +188,50 @@ def _is_content_too_short(file_path: str, content: str) -> bool:
     ext = os.path.splitext(file_path)[1].lower()
     min_lines = _MIN_LINES.get(ext, 0)
     return min_lines > 0 and content.count('\n') < min_lines
+
+
+def _has_stub_functions(file_path: str, content: str) -> list[str]:
+    """Return names of functions/methods whose body is just pass, ..., or a TODO comment.
+
+    These are semantic stubs that pass the line-count check but have no real implementation.
+    Only checks Python files outside of __init__.py and test files (where pass is valid).
+    """
+    if not file_path.endswith(".py"):
+        return []
+    basename = os.path.basename(file_path)
+    if basename in ("__init__.py",) or basename.startswith("test_"):
+        return []
+    import ast as _ast
+    try:
+        tree = _ast.parse(content)
+    except SyntaxError:
+        return []
+    stubs = []
+    for node in _ast.walk(tree):
+        if not isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+            continue
+        body = node.body
+        # Strip docstring
+        if body and isinstance(body[0], _ast.Expr) and isinstance(body[0].value, _ast.Constant):
+            body = body[1:]
+        if not body:
+            stubs.append(node.name)
+            continue
+        # Body is only pass / ... / raise NotImplementedError / TODO comment
+        if len(body) == 1:
+            stmt = body[0]
+            if isinstance(stmt, _ast.Pass):
+                stubs.append(node.name)
+            elif isinstance(stmt, _ast.Expr) and isinstance(stmt.value, _ast.Constant) and stmt.value.value is ...:
+                stubs.append(node.name)
+            elif isinstance(stmt, _ast.Raise):
+                exc = stmt.exc
+                if exc and isinstance(exc, _ast.Call):
+                    func = exc.func
+                    name = func.id if isinstance(func, _ast.Name) else (func.attr if isinstance(func, _ast.Attribute) else "")
+                    if name in ("NotImplementedError", "NotImplemented"):
+                        stubs.append(node.name)
+    return stubs
 
 
 # ── InjectionGuard ────────────────────────────────────────────────────────────
@@ -893,9 +937,14 @@ CRITICAL RULES — violating any of these will break the build:
   file. Import ONLY names that appear in that list. Do not invent or guess import names.
   Example dependency: {"file_path": "src/models.py", "imports_available": ["User", "Task", "Base"]}
   Correct import: `from .models import User, Task`  (not `from .models import Session` — not listed)
-- For files inside a package directory (e.g. src/main.py inside package 'src'), use RELATIVE
-  imports for sibling modules: `from . import crud` not `from src import crud`,
-  `from .models import Task` not `from src.models import Task`.
+- IMPORT STYLE: always use relative imports within a package. Derive the relative path by
+  stripping the shared package prefix. Examples (all files are inside the 'src' package):
+    src/main.py importing src/api/routers/auth.py    → `from .api.routers import auth`
+    src/api/routers/auth.py importing src/database.py → `from ...database import get_db`
+    src/api/routers/auth.py importing src/models/user.py → `from ...models.user import User`
+    src/services/auth_service.py importing src/models/user.py → `from ..models.user import User`
+  Count the dots: one dot per directory level you climb before descending to the target.
+  NEVER use absolute imports like `from src.models import User` inside the src package.
 - For web applications (FastAPI, Flask, Express, etc.) that live inside src/, ALWAYS generate
   a top-level run.py (or index.js) at the project root so the server can be started with
   `python run.py` (or `node index.js`) without needing to know the package structure.
@@ -904,12 +953,34 @@ CRITICAL RULES — violating any of these will break the build:
   - When API responses include related ORM fields, eager-load relations (`selectinload`)
     before returning objects; do not rely on lazy loads during serialization.
   - Avoid code that triggers `sqlalchemy.exc.MissingGreenlet` at runtime.
+  - get_db MUST NOT auto-commit. The correct pattern is:
+    ```python
+    async def get_db() -> AsyncGenerator[AsyncSession, None]:
+        async with AsyncSessionLocal() as session:
+            yield session
+            # NO commit here — endpoints commit explicitly after mutations
+    ```
+    Endpoints that mutate data call `await session.commit()` themselves. get_db never commits.
+  - If the architecture includes an AuditLog model, EVERY create/update/delete endpoint MUST
+    write an AuditLog entry after committing the main change:
+    `db.add(AuditLog(user_id=current_user.id, action="created_course", resource_id=obj.id))`
+    `await db.commit()`
+    Do not generate read-only audit endpoints without the corresponding write calls.
 - FastAPI-specific rules (violating these causes crashes or security holes):
-  - main.py MUST import every router module it references:
-    if you write `app.include_router(auth.router)` you must have `from .routers import auth`.
-    NEVER write `from . import auth` when auth.py lives inside a routers/ sub-package.
-    Always check the file_tree: if the file is at src/routers/auth.py, the import is
-    `from .routers import auth`, NOT `from . import auth`.
+  - IMPORT PATH DERIVATION RULE (most common source of ImportError):
+    Always derive the Python import path directly from the file's path in the file_tree.
+    Convert the file path to a dotted module path by replacing "/" with "." and dropping ".py".
+    Examples:
+      src/api/routers/auth.py     → `from src.api.routers import auth`  (absolute)
+                                    OR `from .api.routers import auth`   (relative from src/)
+      src/api/routers/courses.py  → `from src.api.routers import courses`
+      src/routers/auth.py         → `from src.routers import auth`
+      src/services/auth_service.py → `from src.services import auth_service`
+    NEVER use `from .routers import auth` if the file is actually at src/api/routers/auth.py.
+    NEVER guess — look at the file_tree and derive mechanically.
+  - main.py MUST import every router module it references before calling app.include_router().
+    Define `app = FastAPI(...)` BEFORE any `app.include_router(...)` call.
+  - run.py MUST import `app` from main before using it. Always put all imports at the top.
   - Every router file MUST import every function it calls:
     if you call `verify_password(...)` you must import `verify_password` at the top.
   - Never use `@app.on_event("startup"/"shutdown")` — it is deprecated. Always use the
@@ -924,8 +995,9 @@ CRITICAL RULES — violating any of these will break the build:
     any attribute of the returned user object.
   - ALWAYS set `response_model=` on endpoints that return ORM objects containing
     sensitive fields (passwords, tokens, secrets). Use a Pydantic schema that excludes them.
-  - NEVER provide a fallback default for security-critical env vars. Use:
-    `SECRET_KEY = os.getenv("SECRET_KEY")` then `if not SECRET_KEY: raise RuntimeError(...)`.
+  - For SECRET_KEY, always provide a dev fallback so the app starts in development without env setup:
+    `SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-change-in-production")`
+    Log a warning if running with the default: `if SECRET_KEY == "dev-secret-change-in-production": print("WARNING: Using default SECRET_KEY")`
   - When reading a token from a cookie that was stored as `"Bearer <jwt>"`, strip the
     prefix before decoding: `if token.startswith("Bearer "): token = token[7:]`.
   - Alembic + async SQLAlchemy rules (violating these breaks migrations):
@@ -974,15 +1046,36 @@ CRITICAL RULES — violating any of these will break the build:
     `docs_url="/docs" if os.getenv("ENABLE_DOCS") else None, redoc_url=None`
     This prevents accidental API exposure in production deployments.
   - EVERY auth system MUST implement forgot-password and reset-password endpoints:
-    POST /auth/forgot-password (accepts email, returns reset token in dev, emails in prod)
-    POST /auth/reset-password (accepts token + new_password, updates hash, clears token)
-    Store reset_token and reset_token_expiry (1 hour) on the User model.
+    POST /api/v1/auth/forgot-password (accepts email, returns reset token in dev)
+    POST /api/v1/auth/reset-password (accepts token + new_password, updates hash, clears token)
+    IMPORTANT: Only add reset_token and reset_token_expiry columns to User if they are already
+    defined in the User model in the architecture. NEVER invent columns not in the model schema.
+    If the model does not have these columns, skip the reset flow and return 501 Not Implemented.
   - NEVER use passlib for password hashing — it is broken on Python 3.13+.
     Always use bcrypt directly:
     `import bcrypt`
     `bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()`
     `bcrypt.checkpw(plain.encode(), hashed.encode())`
     Add `bcrypt` (not `passlib[bcrypt]`) to requirements.txt.
+
+REQUIREMENTS.TXT PACKAGE VERSION RULES:
+- ALWAYS use minimum-version pins (>=) not exact pins (==) so pip can resolve compatible wheels.
+- Use ONLY these minimum versions — older versions lack pre-built wheels for Python 3.12+:
+    fastapi>=0.115.0
+    uvicorn[standard]>=0.30.0
+    sqlalchemy>=2.0.0
+    alembic>=1.13.0
+    pydantic>=2.10.0
+    pydantic-settings>=2.5.0
+    python-jose[cryptography]>=3.3.0
+    python-multipart>=0.0.12
+    httpx>=0.27.0
+    bcrypt>=4.1.0
+    pytest>=8.0.0
+    pytest-asyncio>=0.23.0
+    anyio>=4.4.0
+- Do NOT pin to pydantic==1.x or pydantic==2.0..2.9 — those have no Python 3.13/3.14 wheels.
+- Do NOT use exact pins for packages that need compiled extensions (pydantic, cryptography, bcrypt).
 
 FRONTEND QUALITY RULES (applies to every .html, .css, .js file):
 - Write production-quality, visually stunning UI. Aim for the polish level of Stripe, Linear,
@@ -1029,7 +1122,7 @@ FRONTEND QUALITY RULES (applies to every .html, .css, .js file):
   - Glassmorphism panels where appropriate: background rgba(255,255,255,0.03),
     backdrop-filter blur(12px), border 1px solid rgba(255,255,255,0.08).
 - JavaScript rules (app.js must be comprehensive — real interactivity, not stubs):
-  - JWT auth flow: login form → POST /auth/login (form-encoded) → store token in localStorage
+  - JWT auth flow: login form → POST /api/v1/auth/login (form-encoded) → store token in localStorage
     → redirect to role-specific dashboard. Logout clears localStorage, redirects to /login.html.
   - On page load: check localStorage for token → if present and on login page, redirect to dashboard.
   - All API calls: include Authorization: Bearer <token> header, handle 401 by logging out.
@@ -1075,12 +1168,13 @@ HTML RULES:
 - Every HTML file: Google Fonts Inter import, skip-to-content link, ARIA labels, semantic HTML5.
 - NEVER write placeholder text. All content must be real and specific to the project.
 - All pages: sticky navbar with logo + nav links + accessibility buttons (+A/-A, contrast toggle), footer.
-- index.html must have: hero (min-height 90vh, animated gradient), stats bar, features/programs cards,
-  testimonials, team section, donation/CTA section, contact form, footer.
-- login.html: centered card, email + password + role selector, gradient login button, error area.
-- Dashboard pages (student/teacher/admin/staff): sidebar layout, stat cards, real data tables/panels.
+- index.html must have: hero (min-height 90vh, animated gradient), stats bar, feature cards
+  relevant to the project, testimonials or highlights section, CTA section, contact form, footer.
+- login.html: centered card, relevant credential fields, gradient login button, error area.
+  Include a role selector only if the project has multiple user roles.
+- Dashboard pages: sidebar layout, stat cards relevant to the project, real data tables/panels.
   sidebar: dark background, nav items with icons, active state. main: scrollable content area.
-- admin.html: SVG donut chart for role breakdown, CSS bar charts for analytics.
+- Admin/manager dashboards: include summary charts (SVG donut or CSS bar) for key metrics.
 - All forms: labelled inputs, focus glow ring, never outline:none anywhere.
 - Focus indicators on ALL interactive elements: outline: 3px solid var(--primary); outline-offset: 2px.
 - High contrast: [data-theme="high-contrast"] overrides (bg:#000, text:#fff, links:#ffff00).
@@ -1101,7 +1195,7 @@ CSS RULES (style.css must be 300+ lines):
 - .sr-only utility class for screen reader only content.
 
 JS RULES (app.js must be 200+ lines):
-- Auth: login()→POST /auth/token→store token. fetchWithAuth()→Bearer header, 401→logout.
+- Auth: login()→POST /api/v1/auth/login→store token. fetchWithAuth()→Bearer header, 401→logout.
 - On load: restore accessibility prefs (theme, font size, dyslexia) from localStorage.
 - Toast: showToast(msg,type) auto-dismiss 3s, stacks.
 - Accessibility helpers: announceToScreenReader, toggleHighContrast, updateFontSize, toggleDyslexiaFont.
@@ -1443,14 +1537,22 @@ class Executor:
                 print(f"  [TruncationGuard] {node.file_path} is short/truncated ({content.count(chr(10))} lines) — queuing retry")
                 truncated_bulk_nodes.append(node)
                 continue
+            stub_fns = _has_stub_functions(node.file_path, content)
+            if stub_fns:
+                print(f"  [StubGuard] {node.file_path} has unimplemented functions: {stub_fns} — queuing retry")
+                truncated_bulk_nodes.append(node)
+                continue
+
+            _issues = check_file(node.file_path, content)
+            if _issues:
+                print(f"  [LiveGuard] {node.file_path}: {_issues[0]} — queuing retry")
+                truncated_bulk_nodes.append(node)
+                continue
 
             full_path = os.path.join(self.workspace, node.file_path)
             ensure_directory(os.path.dirname(full_path))
             with open(full_path, 'w') as f:
                 f.write(content)
-            _issues = check_file(node.file_path, content)
-            if _issues:
-                print(f"  [LiveGuard] {node.file_path}: {_issues[0]}")
 
             if node.contract and node.contract.public_api:
                 _missing = _verify_contract_exports(node.file_path, content, node.contract.public_api)
@@ -1522,6 +1624,9 @@ class Executor:
 
         Processes batches in dependency-topological order so that when batch N
         runs, batch N-1's files are already on disk and available as dep context.
+        After each batch, extracts ground-truth contracts (ORM columns, Pydantic
+        fields, auth sub claim) and injects them into the next batch's prompt to
+        prevent cross-batch contract drift.
         """
         waves = self._calculate_waves(nodes)
         # Flatten waves into a topologically ordered list, then rechunk
@@ -1531,6 +1636,7 @@ class Executor:
 
         all_generated: list["GeneratedFile"] = []
         all_paths: set[str] = set()
+        prior_contract: str = ""
 
         for idx, chunk in enumerate(chunks):
             print(f"  [Executor] Batch {idx + 1}/{len(chunks)}: {[n.file_path for n in chunk]}")
@@ -1539,11 +1645,15 @@ class Executor:
                 nodes=chunk,
                 global_validation_commands=[],
             )
-            result = await self._stream_bulk_single(chunk, chunk_arch, system_prompt)
+            result = await self._stream_bulk_single(chunk, chunk_arch, system_prompt, prior_contract=prior_contract)
+            batch_files = []
             for gf in result.generated_files:
                 if gf.file_path not in all_paths:
                     all_generated.append(gf)
                     all_paths.add(gf.file_path)
+                    batch_files.append(gf)
+            # Extract contracts from this batch so the next batch can't drift
+            prior_contract = self._extract_batch_contract(all_generated)
 
         return ExecutionResult(generated_files=all_generated)
 
@@ -1552,12 +1662,17 @@ class Executor:
         executable_nodes: list,
         architecture: "Architecture",
         system_prompt: str,
+        prior_contract: str = "",
     ) -> "ExecutionResult":
         """Core streaming bulk generation for a single batch of nodes.
 
         Writes files as they arrive in the stream. After the stream, any file
         that is truncated or suspiciously short is individually retried via
         _execute_node — preventing stubs from propagating to the healer.
+
+        prior_contract: ground-truth contract block extracted from previous batches.
+        Injected at the top of the prompt so the LLM cannot drift from already-written
+        ORM columns, schema fields, or auth conventions.
         """
         node_id_map = {n.node_id: n for n in executable_nodes}
         files_to_implement = [
@@ -1575,10 +1690,11 @@ class Executor:
             }
             for node in executable_nodes
         ]
-        user_prompt = BULK_EXECUTOR_USER_PROMPT_TEMPLATE.format(
+        base_prompt = BULK_EXECUTOR_USER_PROMPT_TEMPLATE.format(
             architecture_context=(_load_project_context(self.workspace) or _build_architecture_context(architecture)),
             files_to_implement=json.dumps(files_to_implement, indent=2),
         )
+        user_prompt = (prior_contract + base_prompt) if prior_contract else base_prompt
         user_prompt = prune_prompt(user_prompt, max_chars=28_000)
 
         node_map = {node.file_path: node for node in executable_nodes}
@@ -1621,6 +1737,19 @@ class Executor:
                     truncated_nodes.append(_node)
                     generated_paths.add(file_path)   # mark as "seen" to skip wave fallback
                     continue
+                stub_fns = _has_stub_functions(file_path, content)
+                if stub_fns:
+                    print(f"  [StubGuard] {file_path} has unimplemented functions: {stub_fns} — queuing for individual retry")
+                    truncated_nodes.append(_node)
+                    generated_paths.add(file_path)
+                    continue
+
+                _issues = check_file(file_path, content)
+                if _issues:
+                    print(f"  [LiveGuard] {file_path}: {_issues[0]} — queuing for individual retry")
+                    truncated_nodes.append(_node)
+                    generated_paths.add(file_path)
+                    continue
 
                 full_path = os.path.join(self.workspace, file_path)
                 ensure_directory(os.path.dirname(full_path))
@@ -1628,9 +1757,6 @@ class Executor:
                     f.write(content)
                 lines = content.count('\n')
                 print(f"  ✓ {file_path} ({lines} lines)")
-                _issues = check_file(file_path, content)
-                if _issues:
-                    print(f"  [LiveGuard] {file_path}: {_issues[0]}")
                 if _node.contract and _node.contract.public_api:
                     _missing = _verify_contract_exports(file_path, content, _node.contract.public_api)
                     if _missing:
@@ -1886,3 +2012,141 @@ class Executor:
             waves.extend(fallback_waves)
 
         return waves
+
+    def _extract_batch_contract(self, generated_files: list) -> str:
+        """AST-scan files written so far and return a ground-truth contract block.
+
+        Extracts:
+        - SQLAlchemy ORM model columns (class name → col_name: type)
+        - Pydantic schema fields (class name → field: type)
+        - JWT sub claim convention (which user field is used as the sub value)
+
+        The returned string is prepended to the next batch's prompt so the LLM
+        cannot invent field names, types, or auth conventions that contradict what
+        is already on disk.
+        """
+        import ast as _ast
+
+        orm_models: dict[str, dict[str, str]] = {}
+        pydantic_schemas: dict[str, dict[str, str]] = {}
+        auth_sub_field: str | None = None
+
+        for gf in generated_files:
+            if not gf.file_path.endswith(".py"):
+                continue
+            try:
+                tree = _ast.parse(gf.content)
+            except SyntaxError:
+                continue
+
+            for node in _ast.walk(tree):
+                if not isinstance(node, _ast.ClassDef):
+                    continue
+
+                is_orm = any(
+                    isinstance(s, _ast.Assign)
+                    and any(isinstance(t, _ast.Name) and t.id == "__tablename__" for t in s.targets)
+                    for s in node.body
+                )
+                is_pydantic = any(
+                    (isinstance(b, _ast.Name) and b.id == "BaseModel")
+                    or (isinstance(b, _ast.Attribute) and b.attr == "BaseModel")
+                    for b in node.bases
+                )
+
+                if is_orm:
+                    cols: dict[str, str] = {}
+                    for stmt in node.body:
+                        if not isinstance(stmt, _ast.Assign):
+                            continue
+                        for target in stmt.targets:
+                            if not (isinstance(target, _ast.Name) and not target.id.startswith("_")):
+                                continue
+                            if not isinstance(stmt.value, _ast.Call):
+                                continue
+                            func = stmt.value.func
+                            func_name = (
+                                func.id if isinstance(func, _ast.Name)
+                                else func.attr if isinstance(func, _ast.Attribute)
+                                else ""
+                            )
+                            if func_name in ("Column", "mapped_column") and stmt.value.args:
+                                col_type = _ast.unparse(stmt.value.args[0])
+                                cols[target.id] = col_type
+                    if cols:
+                        orm_models[node.name] = cols
+
+                if is_pydantic:
+                    fields: dict[str, str] = {}
+                    for stmt in node.body:
+                        if (
+                            isinstance(stmt, _ast.AnnAssign)
+                            and isinstance(stmt.target, _ast.Name)
+                            and not stmt.target.id.startswith("_")
+                            and stmt.target.id != "model_config"
+                        ):
+                            fields[stmt.target.id] = _ast.unparse(stmt.annotation)
+                    if fields:
+                        pydantic_schemas[node.name] = fields
+
+            # Detect JWT sub claim from auth/security files
+            if auth_sub_field is None and any(
+                kw in gf.file_path for kw in ("auth", "security", "token")
+            ):
+                try:
+                    for node in _ast.walk(_ast.parse(gf.content)):
+                        if isinstance(node, _ast.Dict):
+                            for k, v in zip(node.keys, node.values):
+                                if isinstance(k, _ast.Constant) and k.value == "sub":
+                                    auth_sub_field = _ast.unparse(v)
+                                    break
+                        if auth_sub_field:
+                            break
+                except Exception:
+                    pass
+
+        if not orm_models and not pydantic_schemas and not auth_sub_field:
+            return ""
+
+        lines = [
+            "=" * 70,
+            "CROSS-FILE CONTRACT — EXTRACTED FROM ALREADY-WRITTEN FILES",
+            "You MUST match these definitions exactly. Do NOT invent new field names,",
+            "column names, or change types. Deviating causes runtime errors.",
+            "=" * 70,
+        ]
+
+        if orm_models:
+            lines.append("\nORM MODEL COLUMNS (SQLAlchemy — source of truth):")
+            for class_name, cols in orm_models.items():
+                lines.append(f"  class {class_name}:")
+                for col_name, col_type in cols.items():
+                    lines.append(f"    {col_name} = Column({col_type})")
+            lines.append(
+                "  RULE: Only reference column names listed above. "
+                "NEVER use a field not defined here (e.g. reset_token_expiry, is_active "
+                "if not listed). NEVER change a column's type."
+            )
+
+        if pydantic_schemas:
+            lines.append("\nPYDANTIC SCHEMA FIELDS (source of truth):")
+            for class_name, fields in pydantic_schemas.items():
+                lines.append(f"  class {class_name}(BaseModel):")
+                for fname, ftype in fields.items():
+                    lines.append(f"    {fname}: {ftype}")
+            lines.append(
+                "  RULE: Schema field names MUST match ORM column names exactly. "
+                "No invented fields. No type mismatches (e.g. bool vs String)."
+            )
+
+        if auth_sub_field:
+            lines.append(f"\nJWT SUB CLAIM: `{auth_sub_field}`")
+            lines.append(
+                f"  RULE: The JWT 'sub' claim is set to `{auth_sub_field}` at login. "
+                "ALL code that decodes the token and looks up the user MUST query "
+                f"by the same field as `{auth_sub_field}`. "
+                "NEVER mix email-based sub with username-based lookup or vice versa."
+            )
+
+        lines.append("=" * 70 + "\n")
+        return "\n".join(lines) + "\n"
